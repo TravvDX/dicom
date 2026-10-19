@@ -36,6 +36,9 @@ var (
 	ErrorExpectedEvenLength           = errors.New("field length is not even, in violation of DICOM spec")
 	ErrorExpectedDefinedLength        = errors.New("unable to read field of undefined length")
 	ErrorExpectedSequenceDelimitation = errors.New("expected to find sequence delimitation item (fffe,e0dd)")
+	// ErrorSequenceTooDeep indicates that sequences or items were nested
+	// deeper than the MaxSequenceDepth parse option allows.
+	ErrorSequenceTooDeep = errors.New("sequences nested deeper than the maximum sequence depth")
 	// ErrorInvalidPixelDimensions indicates that the elements describing native
 	// PixelData (Rows, Columns, NumberOfFrames, BitsAllocated, SamplesPerPixel)
 	// are missing a value, have the wrong type, or describe no pixels.
@@ -50,7 +53,23 @@ var (
 type reader struct {
 	rawReader *dicomio.Reader
 	opts      parseOptSet
+	// depth counts the sequences and items open around the element being read.
+	depth int
 }
+
+// enterNesting is called on entry to every sequence and item, before reading
+// what it contains. The check has to run before the recursion: an unbounded
+// nest ends in a stack overflow recover() cannot catch.
+func (r *reader) enterNesting() error {
+	// A sequence and its item are two levels.
+	if r.depth/2 >= r.opts.maxSequenceDepth {
+		return ErrorSequenceTooDeep
+	}
+	r.depth++
+	return nil
+}
+
+func (r *reader) leaveNesting() { r.depth-- }
 
 func (r *reader) readTag() (*tag.Tag, error) {
 	group, gerr := r.rawReader.ReadUInt16()
@@ -600,6 +619,10 @@ func readNativeFrame[I constraints.Integer](bitsAllocated, rows, cols, bytesToRe
 // a set of Elements.
 // See https://dicom.nema.org/medical/dicom/current/output/chtml/part05/sect_7.5.2.html#table_7.5-1
 func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Value, error) {
+	if err := r.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer r.leaveNesting()
 	var sequences sequencesValue
 
 	seqElements := &Dataset{}
@@ -608,7 +631,7 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 			subElement, err := r.readElement(seqElements, nil)
 			if err != nil {
 				// Stop reading due to error
-				return nil, fmt.Errorf("readSequence: error reading subitem in a sequence: %w", err)
+				return nil, err
 			}
 			if subElement.Tag == tag.SequenceDelimitationItem {
 				// Stop reading
@@ -634,7 +657,7 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 			subElement, err := r.readElement(seqElements, nil)
 			if err != nil {
 				// TODO: option to ignore errors parsing subelements?
-				return nil, fmt.Errorf("readSequence: error reading subitem in a sequence: %w", err)
+				return nil, err
 			}
 
 			// Append the Item element's dataset of elements to this Sequence's sequencesValue.
@@ -649,6 +672,10 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 // readSequenceItem reads an item component of a sequence dicom element and returns an Element
 // with a SequenceItem value.
 func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (Value, error) {
+	if err := r.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer r.leaveNesting()
 	var sequenceItem SequenceItemValue
 
 	// seqElements holds items read so far.
@@ -659,7 +686,7 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 		for {
 			subElem, err := r.readElement(&seqElements, nil)
 			if err != nil {
-				return nil, fmt.Errorf("readSequenceItem: error reading subitem in a sequence item: %w", err)
+				return nil, err
 			}
 			if subElem.Tag == tag.ItemDelimitationItem {
 				break
@@ -677,7 +704,7 @@ func (r *reader) readSequenceItem(t tag.Tag, vr string, vl uint32, d *Dataset) (
 		for !r.rawReader.IsLimitExhausted() {
 			subElem, err := r.readElement(&seqElements, nil)
 			if err != nil {
-				return nil, fmt.Errorf("readSequenceItem: error reading subitem in a sequence item: %w", err)
+				return nil, err
 			}
 
 			sequenceItem.elements = append(sequenceItem.elements, subElem)
@@ -892,6 +919,13 @@ func (r *reader) readElement(d *Dataset, fc chan<- *frame.Frame) (*Element, erro
 
 	val, err := r.readValue(*t, vr, vl, readImplicit, d, fc)
 	if err != nil {
+		// Inside a sequence or item the error passes up as is, and only the
+		// top-level element wraps it: wrapped at every level, the message
+		// (which can quote a whole element) would be copied once per level of
+		// up to 2*MaxSequenceDepth.
+		if r.depth > 0 {
+			return nil, err
+		}
 		return nil, fmt.Errorf("readElement: error when reading value for element %v: %w", t, err)
 	}
 

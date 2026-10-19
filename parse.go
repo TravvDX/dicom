@@ -284,10 +284,16 @@ type parseOptSet struct {
 	skipProcessingPixelDataValue       bool
 	allowMissingMetaElementGroupLength bool
 	allowUnknownSpecificCharacterSet   bool
+	maxSequenceDepth                   int
 }
 
+// DefaultMaxSequenceDepth is the sequence nesting depth allowed when the
+// MaxSequenceDepth option is not given. Structured report content trees, the
+// deepest found in practice, stay in the tens.
+const DefaultMaxSequenceDepth = 64
+
 func toParseOptSet(opts ...ParseOption) parseOptSet {
-	optSet := parseOptSet{}
+	optSet := parseOptSet{maxSequenceDepth: DefaultMaxSequenceDepth}
 	for _, opt := range opts {
 		opt(&optSet)
 	}
@@ -316,6 +322,16 @@ func AllowMissingMetaElementGroupLength() ParseOption {
 func AllowUnknownSpecificCharacterSet() ParseOption {
 	return func(set *parseOptSet) {
 		set.allowUnknownSpecificCharacterSet = true
+	}
+}
+
+// MaxSequenceDepth sets how deeply sequences may nest (a sequence inside an
+// item of another sequence is depth 2). Parsing a dataset nested deeper
+// returns ErrorSequenceTooDeep; n <= 0 refuses every sequence. The default is
+// DefaultMaxSequenceDepth.
+func MaxSequenceDepth(n int) ParseOption {
+	return func(set *parseOptSet) {
+		set.maxSequenceDepth = n
 	}
 }
 
