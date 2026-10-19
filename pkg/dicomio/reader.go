@@ -54,6 +54,18 @@ func (r *Reader) BytesLeftUntilLimit() int64 {
 	return r.limit - r.bytesRead
 }
 
+// Available returns ErrorInsufficientBytesLeft when n is more than the bytes
+// the Reader can still supply. Every allocation sized from a value in the
+// input calls it first, so a declared length can never allocate more than the
+// input holds. A Reader limited by LimitReadUntilEOF has no bound to check, so
+// callers parsing untrusted input must pass its size.
+func (r *Reader) Available(n int64) error {
+	if n < 0 || n > r.BytesLeftUntilLimit() {
+		return ErrorInsufficientBytesLeft
+	}
+	return nil
+}
+
 func (r *Reader) Read(p []byte) (int, error) {
 	// Check if we've hit the limit
 	if r.BytesLeftUntilLimit() <= 0 {
@@ -141,6 +153,9 @@ func internalReadString(data []byte, d *encoding.Decoder) (string, error) {
 
 // ReadString reads a string from the underlying *Reader.
 func (r *Reader) ReadString(n uint32) (string, error) {
+	if err := r.Available(int64(n)); err != nil {
+		return "", err
+	}
 	data := make([]byte, n)
 	_, err := io.ReadFull(r, data)
 	if err != nil {
@@ -202,13 +217,22 @@ func (r *Reader) SetTransferSyntax(bo binary.ByteOrder, implicit bool) {
 // transfer syntax. Right now this is expected to be called once when
 // parsing the top level dicom data, and there is no facility to swap
 // between deflate and non-deflate reading.
-// This also sets the current limit to LimitReadUntilEOF, since the original
-// limits (if any) will be based on uncompressed bytes.
+// The original limit counts compressed bytes, so it is replaced with the most
+// those bytes can inflate to, or LimitReadUntilEOF if there was no limit.
 func (r *Reader) SetDeflate() {
 	r.in = bufio.NewReader(flate.NewReader(r.in))
-	// TODO(https://github.com/suyashkumar/dicom/issues/320): consider always
-	// having the top level limit read until EOF.
-	r.limit = LimitReadUntilEOF // needed because original limits may not apply to the deflated *Reader
+	if r.limit == LimitReadUntilEOF {
+		return
+	}
+	// 1032:1 is deflate's maximum expansion ratio (zlib's technical details).
+	// Bounding by it keeps Available meaningful on deflated input.
+	const maxDeflateRatio = 1032
+	left := r.limit - r.bytesRead
+	if left > (math.MaxInt64-r.bytesRead)/maxDeflateRatio {
+		r.limit = LimitReadUntilEOF
+		return
+	}
+	r.limit = r.bytesRead + left*maxDeflateRatio
 }
 
 // IsImplicit returns if the currently set transfer syntax on this *Reader is

@@ -322,6 +322,9 @@ func (r *reader) readPixelData(vl uint32, d *Dataset, fc chan<- *frame.Frame) (V
 	}
 
 	if r.opts.skipProcessingPixelDataValue {
+		if err := r.rawReader.Available(int64(vl)); err != nil {
+			return nil, fmt.Errorf("readPixelData: %w", err)
+		}
 		val := &pixelDataValue{PixelDataInfo{IntentionallyUnprocessed: true}}
 		val.PixelDataInfo.UnprocessedValueData = make([]byte, vl)
 		_, err := io.ReadFull(r.rawReader, val.PixelDataInfo.UnprocessedValueData)
@@ -388,7 +391,10 @@ func fillBufferSingleBitAllocated(pixelData []int, d *dicomio.Reader, bo binary.
 	return nil
 }
 
-func makeErrorPixelData(reader io.Reader, vl uint32, fc chan<- *frame.Frame, parseErr error) (*PixelDataInfo, error) {
+func makeErrorPixelData(reader *dicomio.Reader, vl uint32, fc chan<- *frame.Frame, parseErr error) (*PixelDataInfo, error) {
+	if err := reader.Available(int64(vl)); err != nil {
+		return nil, fmt.Errorf("makeErrorPixelData: %w", err)
+	}
 	data := make([]byte, vl)
 	_, err := io.ReadFull(reader, data)
 	if err != nil {
@@ -677,6 +683,9 @@ func (r *reader) readBytes(t tag.Tag, vr string, vl uint32) (Value, error) {
 	if vl == tag.VLUndefinedLength {
 		return nil, ErrorExpectedDefinedLength
 	}
+	if err := r.rawReader.Available(int64(vl)); err != nil {
+		return nil, fmt.Errorf("error reading bytes element (%v) value: %w", t, err)
+	}
 
 	// TODO: add special handling of PixelData
 	if vr == vrraw.OtherByte || vr == vrraw.Unknown {
@@ -733,12 +742,24 @@ func (r *reader) readString(t tag.Tag, vr string, vl uint32) (Value, error) {
 	return &stringsValue{value: strs}, nil
 }
 
+// initialCapacity is the starting capacity for vl bytes of values at least
+// minSize bytes each. It is capped so that a reader with no limit cannot be
+// made to allocate from the declared length; append grows past the cap only
+// as values are actually read.
+func initialCapacity(vl uint32, minSize uint32) int {
+	const maxInitialCapacity = 1 << 16
+	return int(min(vl/minSize, maxInitialCapacity))
+}
+
 func (r *reader) readFloat(t tag.Tag, vr string, vl uint32) (Value, error) {
+	if err := r.rawReader.Available(int64(vl)); err != nil {
+		return nil, fmt.Errorf("error reading floating point element (%v) value: %w", t, err)
+	}
 	err := r.rawReader.PushLimit(int64(vl))
 	if err != nil {
 		return nil, err
 	}
-	retVal := &floatsValue{value: make([]float64, 0, vl/2)}
+	retVal := &floatsValue{value: make([]float64, 0, initialCapacity(vl, 4))}
 	for !r.rawReader.IsLimitExhausted() {
 		switch vr {
 		case vrraw.FloatingPointSingle:
@@ -783,11 +804,14 @@ func (r *reader) readDate(t tag.Tag, vr string, vl uint32) (Value, error) {
 
 func (r *reader) readInt(t tag.Tag, vr string, vl uint32) (Value, error) {
 	// TODO: add other integer types here
+	if err := r.rawReader.Available(int64(vl)); err != nil {
+		return nil, fmt.Errorf("error reading int element (%v) value: %w", t, err)
+	}
 	err := r.rawReader.PushLimit(int64(vl))
 	if err != nil {
 		return nil, err
 	}
-	retVal := &intsValue{value: make([]int, 0, vl/2)}
+	retVal := &intsValue{value: make([]int, 0, initialCapacity(vl, 2))}
 	for !r.rawReader.IsLimitExhausted() {
 		switch vr {
 		case vrraw.UnsignedShort, vrraw.AttributeTag:
@@ -905,6 +929,13 @@ func (r *reader) readRawItem(shouldSkip bool) ([]byte, bool, error) {
 			return nil, false, fmt.Errorf("readRawItem: error when skipping item %v (vl=%d): %w", t, vl, err)
 		}
 	} else {
+		if err := r.rawReader.Available(int64(vl)); err != nil {
+			// readPixelData ends the frames on this error and goes on parsing,
+			// so the reader must be at the limit, where reading the value
+			// would have left it.
+			_ = r.rawReader.Skip(r.rawReader.BytesLeftUntilLimit())
+			return nil, false, fmt.Errorf("readRawItem: error when reading item %v (vl=%d): %w", t, vl, err)
+		}
 		data := make([]byte, vl)
 		_, err = io.ReadFull(r.rawReader, data)
 		if err != nil {
