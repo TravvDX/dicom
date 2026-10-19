@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/bits"
 	"strconv"
 	"strings"
 	"unicode"
@@ -34,6 +36,10 @@ var (
 	ErrorExpectedEvenLength           = errors.New("field length is not even, in violation of DICOM spec")
 	ErrorExpectedDefinedLength        = errors.New("unable to read field of undefined length")
 	ErrorExpectedSequenceDelimitation = errors.New("expected to find sequence delimitation item (fffe,e0dd)")
+	// ErrorInvalidPixelDimensions indicates that the elements describing native
+	// PixelData (Rows, Columns, NumberOfFrames, BitsAllocated, SamplesPerPixel)
+	// are missing a value, have the wrong type, or describe no pixels.
+	ErrorInvalidPixelDimensions = errors.New("invalid native PixelData dimensions")
 )
 
 // reader is responsible for mid-level dicom parsing capabilities, like
@@ -363,9 +369,9 @@ func fillBufferSingleBitAllocated(pixelData []int, d *dicomio.Reader, bo binary.
 	}
 
 	var currentByte byte
+	rawData := make([]byte, 1)
 	for i := 0; i < len(pixelData)/8; i++ {
-		rawData := make([]byte, 1)
-		_, err := d.Read(rawData)
+		_, err := io.ReadFull(d, rawData)
 		if err != nil {
 			return err
 		}
@@ -422,62 +428,59 @@ func makeErrorPixelData(reader *dicomio.Reader, vl uint32, fc chan<- *frame.Fram
 func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, vl uint32) (pixelData *PixelDataInfo,
 	bytesToRead int, err error) {
 	// Parse information from previously parsed attributes that are needed to parse NativeData Frames:
-	rows, err := parsedData.FindElementByTag(tag.Rows)
+	rows, err := firstInt(parsedData, tag.Rows)
 	if err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: error finding Rows tag: %w", err)
+		return nil, 0, fmt.Errorf("readNativeFrames: Rows: %w", err)
+	}
+	cols, err := firstInt(parsedData, tag.Columns)
+	if err != nil {
+		return nil, 0, fmt.Errorf("readNativeFrames: Columns: %w", err)
 	}
 
-	cols, err := parsedData.FindElementByTag(tag.Columns)
-	if err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: error finding Columns tag: %w", err)
-	}
-
-	nof, err := parsedData.FindElementByTag(tag.NumberOfFrames)
-	nFrames := 0
-	if err == nil {
-		// No error, so parse number of frames
-		nFrames, err = strconv.Atoi(MustGetStrings(nof.Value)[0]) // odd that number of frames is encoded as a string...
+	nFrames := 1
+	if nof, err := parsedData.FindElementByTag(tag.NumberOfFrames); err == nil {
+		// odd that number of frames is encoded as a string...
+		nFrames, err = numberOfFrames(nof)
 		if err != nil {
-			return nil, 0, fmt.Errorf("readNativeFrames: error converting NumberOfFrames from string to int: %w", err)
+			return nil, 0, fmt.Errorf("readNativeFrames: NumberOfFrames: %w", err)
 		}
-	} else {
-		// error fetching NumberOfFrames, so default to 1. TODO: revisit
-		nFrames = 1
 	}
 
-	b, err := parsedData.FindElementByTag(tag.BitsAllocated)
+	bitsAllocated, err := firstInt(parsedData, tag.BitsAllocated)
 	if err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: error finding BitsAllocated tag: %w", err)
+		return nil, 0, fmt.Errorf("readNativeFrames: BitsAllocated: %w", err)
 	}
-	bitsAllocated := MustGetInts(b.Value)[0]
-
-	s, err := parsedData.FindElementByTag(tag.SamplesPerPixel)
+	samplesPerPixel, err := firstInt(parsedData, tag.SamplesPerPixel)
 	if err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: error finding SamplesPerPixel tag: %w", err)
+		return nil, 0, fmt.Errorf("readNativeFrames: SamplesPerPixel: %w", err)
 	}
-	samplesPerPixel := MustGetInts(s.Value)[0]
 
-	pixelsPerFrame := MustGetInts(rows.Value)[0] * MustGetInts(cols.Value)[0]
+	debug.Logf("readNativeFrames:\nRows: %d\nCols:%d\nFrames::%d\nBitsAlloc:%d\nSamplesPerPixel:%d", rows, cols, nFrames, bitsAllocated, samplesPerPixel)
 
-	debug.Logf("readNativeFrames:\nRows: %d\nCols:%d\nFrames::%d\nBitsAlloc:%d\nSamplesPerPixel:%d", MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], nFrames, bitsAllocated, samplesPerPixel)
-
+	// Computed in 64 bits, saturating rather than wrapping, so no product of
+	// declared dimensions can wrap around to equal vl. Zero and negative
+	// dimensions take the mismatch path below like any other wrong size.
+	samplesPerFrame := mulSaturating(saturatingUint(rows), saturatingUint(cols), saturatingUint(samplesPerPixel))
 	bytesAllocated := bitsAllocated / 8
-	bytesToRead = bytesAllocated * samplesPerPixel * pixelsPerFrame * nFrames
+	var bytesPerFrame uint64
 	if bitsAllocated == 1 {
-		bytesToRead = pixelsPerFrame * samplesPerPixel / 8 * nFrames
+		bytesPerFrame = samplesPerFrame / 8
+	} else {
+		bytesPerFrame = mulSaturating(samplesPerFrame, saturatingUint(bytesAllocated))
 	}
+	total := mulSaturating(bytesPerFrame, saturatingUint(nFrames))
 
 	skipFinalPaddingByte := false
-	if uint32(bytesToRead) != vl {
+	if total != uint64(vl) {
 		switch {
-		case uint32(bytesToRead) == vl-1 && vl%2 == 0:
+		case vl > 0 && total == uint64(vl)-1 && vl%2 == 0:
 			skipFinalPaddingByte = true
-		case uint32(bytesToRead) == vl-1 && vl%2 != 0:
+		case vl > 0 && total == uint64(vl)-1 && vl%2 != 0:
 			return nil, 0, fmt.Errorf("error when reading Native PixelData, got vl=%d, expected even VL: %w", vl, ErrorExpectedEvenLength)
 		default:
 			// calculated bytesToRead and actual VL mismatch
 			if !r.opts.allowMismatchPixelDataLength {
-				return nil, 0, fmt.Errorf("error when reading Native PixelData: expected_vl=%d actual_vl=%d %w", bytesToRead, vl, ErrorMismatchPixelDataLength)
+				return nil, 0, fmt.Errorf("error when reading Native PixelData: expected_vl=%d actual_vl=%d %w", total, vl, ErrorMismatchPixelDataLength)
 			}
 			image, err := makeErrorPixelData(r.rawReader, vl, fc, ErrorMismatchPixelDataLength)
 			if err != nil {
@@ -485,6 +488,21 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 			}
 			return image, int(vl), nil
 		}
+	}
+	switch bitsAllocated {
+	case 1, 8, 16, 32:
+	default:
+		return nil, 0, fmt.Errorf("unsupported bitsAllocated, got: %v, %w", bitsAllocated, ErrorUnsupportedBitsAllocated)
+	}
+	// Zero-byte frames would let NumberOfFrames alone size the frame slice.
+	if nFrames != 0 && bytesPerFrame == 0 {
+		return nil, 0, fmt.Errorf("readNativeFrames: frames hold no bytes: %w", ErrorInvalidPixelDimensions)
+	}
+	// total is at most vl here, so it and every factor fit in an int.
+	pixelsPerFrame := rows * cols
+	bytesToRead = int(total)
+	if err := r.rawReader.Available(int64(vl)); err != nil {
+		return nil, 0, fmt.Errorf("readNativeFrames: %w", err)
 	}
 
 	// Parse the pixels:
@@ -501,27 +519,19 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 		}
 
 		if bitsAllocated == 1 {
-			buf := make([]int, pixelsPerFrame*samplesPerPixel) // override buf for now
-			if err := fillBufferSingleBitAllocated(buf, r.rawReader, bo); err != nil {
+			nativeFrame := frame.NewNativeFrame[int](bitsAllocated, rows, cols, pixelsPerFrame, samplesPerPixel)
+			if err := fillBufferSingleBitAllocated(nativeFrame.RawData, r.rawReader, bo); err != nil {
 				return nil, bytesToRead, err
-			}
-			nativeFrame := frame.NewNativeFrame[int](bitsAllocated, MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], pixelsPerFrame, samplesPerPixel)
-			for pixel := 0; pixel < pixelsPerFrame; pixel++ {
-				for value := 0; value < samplesPerPixel; value++ {
-					nativeFrame.RawData[(pixel*samplesPerPixel)+value] = buf[pixel*samplesPerPixel+value]
-				}
 			}
 			currentFrame.NativeData = nativeFrame
 		} else {
 			switch bitsAllocated {
 			case 8:
-				currentFrame, _, err = readNativeFrame[uint8](bitsAllocated, MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
+				currentFrame, _, err = readNativeFrame[uint8](bitsAllocated, rows, cols, bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
 			case 16:
-				currentFrame, _, err = readNativeFrame[uint16](bitsAllocated, MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
+				currentFrame, _, err = readNativeFrame[uint16](bitsAllocated, rows, cols, bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
 			case 32:
-				currentFrame, _, err = readNativeFrame[uint32](bitsAllocated, MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
-			default:
-				return nil, bytesToRead, fmt.Errorf("unsupported bitsAllocated, got: %v, %w", bitsAllocated, ErrorUnsupportedBitsAllocated)
+				currentFrame, _, err = readNativeFrame[uint32](bitsAllocated, rows, cols, bytesToRead, samplesPerPixel, pixelsPerFrame, pixelBuf, r.rawReader)
 			}
 		}
 		if err != nil {
@@ -949,4 +959,66 @@ func (r *reader) readRawItem(shouldSkip bool) ([]byte, bool, error) {
 // moreToRead returns true if there is more to read from the underlying dicom.
 func (r *reader) moreToRead() bool {
 	return !r.rawReader.IsLimitExhausted()
+}
+
+// firstInt returns the first value of an integer element. A missing element
+// returns the lookup error; a non-integer element or one with no value
+// returns ErrorInvalidPixelDimensions.
+func firstInt(d *Dataset, t tag.Tag) (int, error) {
+	e, err := d.FindElementByTag(t)
+	if err != nil {
+		return 0, err
+	}
+	ints, ok := e.Value.GetValue().([]int)
+	if !ok || len(ints) == 0 {
+		return 0, ErrorInvalidPixelDimensions
+	}
+	return ints[0], nil
+}
+
+// numberOfFrames reads NumberOfFrames, which is an IS (a string) but appears
+// as an integer element in files with a wrong explicit VR.
+func numberOfFrames(e *Element) (int, error) {
+	var n int
+	switch v := e.Value.GetValue().(type) {
+	case []string:
+		if len(v) == 0 {
+			return 0, ErrorInvalidPixelDimensions
+		}
+		var err error
+		if n, err = strconv.Atoi(strings.TrimSpace(v[0])); err != nil {
+			return 0, fmt.Errorf("error converting NumberOfFrames from string to int: %w", err)
+		}
+	case []int:
+		if len(v) == 0 {
+			return 0, ErrorInvalidPixelDimensions
+		}
+		n = v[0]
+	default:
+		return 0, ErrorInvalidPixelDimensions
+	}
+	return n, nil
+}
+
+// saturatingUint converts a dimension for mulSaturating; a negative one
+// becomes math.MaxUint64 so that it cannot match any vl.
+func saturatingUint(v int) uint64 {
+	if v < 0 {
+		return math.MaxUint64
+	}
+	return uint64(v)
+}
+
+// mulSaturating multiplies without wrapping, returning math.MaxUint64 on
+// overflow.
+func mulSaturating(factors ...uint64) uint64 {
+	product := uint64(1)
+	for _, f := range factors {
+		hi, lo := bits.Mul64(product, f)
+		if hi != 0 {
+			return math.MaxUint64
+		}
+		product = lo
+	}
+	return product
 }
