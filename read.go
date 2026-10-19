@@ -252,7 +252,11 @@ func (r *reader) readHeader() ([]*Element, error) {
 	}
 
 	if metaElementGroupLengthDefined {
-		metaLen := maybeMetaLen.Value.GetValue().([]int)[0]
+		metaLens := maybeMetaLen.Value.GetValue().([]int)
+		if len(metaLens) == 0 {
+			return nil, ErrorMetaElementGroupLength
+		}
+		metaLen := metaLens[0]
 
 		// Read the metadata elements
 		err = r.rawReader.PushLimit(int64(metaLen))
@@ -659,9 +663,13 @@ func (r *reader) readSequence(t tag.Tag, vr string, vl uint32, d *Dataset) (Valu
 				// TODO: option to ignore errors parsing subelements?
 				return nil, err
 			}
+			item, ok := subElement.Value.(*SequenceItemValue)
+			if !ok {
+				return nil, fmt.Errorf("readSequence: error, non item element found in sequence. got: %v", subElement)
+			}
 
 			// Append the Item element's dataset of elements to this Sequence's sequencesValue.
-			sequences.value = append(sequences.value, subElement.Value.(*SequenceItemValue))
+			sequences.value = append(sequences.value, item)
 		}
 		r.rawReader.PopLimit()
 	}

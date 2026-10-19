@@ -162,8 +162,15 @@ func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, 
 	ts, err := p.dataset.FindElementByTag(tag.TransferSyntaxUID)
 	if err == nil {
 		// If we found the transfer syntax, apply it.
-		tsStr := MustGetStrings(ts.Value)[0]
+		tsStrs, ok := ts.Value.GetValue().([]string)
+		if !ok || len(tsStrs) == 0 {
+			return nil, fmt.Errorf("TransferSyntaxUID has no string value: %w", ErrorElementNotFound)
+		}
+		tsStr := tsStrs[0]
 		bo, implicit, err = uid.ParseTransferSyntaxUID(tsStr)
+		if bo == nil {
+			return nil, fmt.Errorf("could not parse transfer syntax uid %q: %w", tsStr, err)
+		}
 		if err != nil {
 			// TODO(suyashkumar): should we attempt to parse with LittleEndian
 			// Implicit here?
@@ -250,7 +257,7 @@ func (p *Parser) Next() (*Element, error) {
 	// TODO: add dicom options to only keep track of certain tags
 
 	if elem.Tag == tag.SpecificCharacterSet {
-		encodingNames := MustGetStrings(elem.Value)
+		encodingNames, _ := elem.Value.GetValue().([]string)
 		cs, err := charset.ParseSpecificCharacterSet(encodingNames)
 		if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
 			return nil, err
