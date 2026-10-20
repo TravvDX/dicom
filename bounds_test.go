@@ -659,13 +659,14 @@ func TestParse_NativeFramesAllocationMultiple(t *testing.T) {
 		vl       int
 		multiple int
 	}{
-		{name: "8-bit 4x5", image: nativeImage(4, 5, 8, 1, "4096"), vl: 20 * 4096, multiple: 10},
-		{name: "16-bit 2x5", image: nativeImage(2, 5, 16, 1, "4096"), vl: 20 * 4096, multiple: 10},
-		{name: "32-bit 1x5", image: nativeImage(1, 5, 32, 1, "4096"), vl: 20 * 4096, multiple: 10},
+		{name: "8-bit 4x6", image: nativeImage(4, 6, 8, 1, "4096"), vl: 24 * 4096, multiple: 10},
+		{name: "8-bit 1x23, many frames", image: nativeImage(1, 23, 8, 1, "200000"), vl: 23 * 200000, multiple: 10},
+		{name: "16-bit 2x6", image: nativeImage(2, 6, 16, 1, "200000"), vl: 24 * 200000, multiple: 10},
+		{name: "32-bit 1x6", image: nativeImage(1, 6, 32, 1, "4096"), vl: 24 * 4096, multiple: 10},
 		{name: "8-bit RGB 512x512", image: nativeImage(512, 512, 8, 3, "2 "), vl: 512 * 512 * 3 * 2, multiple: 10},
-		{name: "1-bit 20x8", image: nativeImage(20, 8, 1, 1, "4096"), vl: 20 * 4096, multiple: 73},
+		{name: "1-bit 24x8", image: nativeImage(24, 8, 1, 1, "4096"), vl: 24 * 4096, multiple: 73},
 		{name: "1-bit 16x16 segmentation", image: nativeImage(16, 16, 1, 1, "2000"), vl: 32 * 2000, multiple: 73},
-		{name: "tiny frames within the allowance", image: nativeImage(1, 1, 8, 1, "400 "), vl: 400, multiple: 10},
+		{name: "tiny frames within the allowance", image: nativeImage(1, 1, 8, 1, "300 "), vl: 300, multiple: 10},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -682,6 +683,43 @@ func TestParse_NativeFramesAllocationMultiple(t *testing.T) {
 // Native frames are allocated as their bytes arrive, so a parse with no exact
 // limit costs what an exact one does, and each frame reaches the frame
 // channel once read.
+func TestParse_ZeroFramesParse(t *testing.T) {
+	for _, bits := range []uint16{1, 8, 16} {
+		data := explicitFile(nativeImage(512, 512, bits, 1, "0 "), explicitElem(tag.PixelData, "OW", 0, nil))
+		ds, err := parseBounded(t, data, maxBoundedAlloc)
+		if err != nil {
+			t.Errorf("%d bits: Parse error = %v", bits, err)
+			continue
+		}
+		px, err := ds.FindElementByTag(tag.PixelData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frames := MustGetPixelDataInfo(px.Value).Frames; frames == nil || len(frames) != 0 {
+			t.Errorf("%d bits: Frames = %#v, want empty and non-nil", bits, frames)
+		}
+	}
+}
+
+func TestParse_NegativeGroupLengthIsRefused(t *testing.T) {
+	// -(9999 + bytes read) would land the limit on LimitReadUntilEOF.
+	negative := int32(-10143)
+	for _, vr := range []string{"SL", "SS"} {
+		length := binary.LittleEndian.AppendUint32(nil, uint32(negative))
+		if vr == "SS" {
+			length = us(uint16(int16(negative)))
+		}
+		data := cat(
+			make([]byte, 128), []byte("DICM"),
+			explicitElem(tag.FileMetaInformationGroupLength, vr, uint32(len(length)), length),
+			explicitElem(tag.FileMetaInformationVersion, "OB", 256<<20, []byte{0, 1}),
+		)
+		if _, err := parseBounded(t, data, maxBoundedAlloc); !errors.Is(err, ErrorMetaElementGroupLength) {
+			t.Errorf("%s: Parse error = %v, want %v", vr, err, ErrorMetaElementGroupLength)
+		}
+	}
+}
+
 func TestParse_NativeFramesAllocateAsRead(t *testing.T) {
 	const vl = 8 << 20
 	body := cat(nativeImage(512, 512, 16, 1, "16"), explicitElem(tag.PixelData, "OW", vl, make([]byte, vl)))

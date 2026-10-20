@@ -87,8 +87,9 @@ func (r *Reader) ReadBytes(n int64) ([]byte, error) {
 // AppendBytes reads exactly n bytes and appends them to dst. An n past the
 // limit is refused with an error wrapping ErrorInsufficientBytesLeft before
 // anything is read. When dst lacks room, an exact limit allocates once;
-// otherwise the buffer grows as bytes arrive, so a declared length allocates
-// at most about twice the bytes actually read. Like io.ReadFull, it returns
+// otherwise the buffer grows as bytes arrive: the buffer returned is at most
+// about twice the bytes read, and all the buffers grown on the way about
+// three times (four for a value cut short). Like io.ReadFull, it returns
 // io.EOF only if no bytes were read.
 func (r *Reader) AppendBytes(dst []byte, n int64) ([]byte, error) {
 	if err := r.Available(n); err != nil {
@@ -227,6 +228,11 @@ func (r *Reader) Skip(n int64) error {
 
 // PushLimit creates a limit n bytes from the current position.
 func (r *Reader) PushLimit(n int64) error {
+	// A negative n could land the limit on LimitReadUntilEOF, unlimiting
+	// a Reader whose limit is still taken as exact.
+	if n < 0 {
+		return fmt.Errorf("negative limit %d: %w", n, ErrorInsufficientBytesLeft)
+	}
 	newLimit := r.bytesRead + n
 	if newLimit > r.limit && r.limit != LimitReadUntilEOF {
 		return fmt.Errorf("new limit exceeds current limit of buffer, new limit: %d, limit: %d: %w", newLimit, r.limit, ErrorInsufficientBytesLeft)

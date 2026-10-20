@@ -127,7 +127,8 @@ func inflatedSize(data []byte) uint64 {
 
 // groupLengthEnd is where the meta group ends by its (0002,0000) value, or 0
 // where the parser takes no group length. As readHeader does, it takes the
-// first value of any integer VR, whose values must fill the element exactly.
+// first value of any integer VR, whose values must fill the element exactly,
+// and refuses a negative one.
 func groupLengthEnd(data []byte, at int) int {
 	if len(data) < at+8 || binary.LittleEndian.Uint16(data[at:]) != 0x0002 || binary.LittleEndian.Uint16(data[at+2:]) != 0 {
 		return 0
@@ -159,9 +160,10 @@ func groupLengthEnd(data []byte, at int) int {
 	default:
 		return 0
 	}
-	// A negative length leaves the limit behind the reader, which ends the
-	// group at once.
-	return end + int(max(length, 0))
+	if length < 0 {
+		return 0
+	}
+	return end + int(length)
 }
 
 // metaWalkEnd is where the meta group ends when the parser walks it: past the

@@ -51,13 +51,14 @@ var (
 // (none for 8 bits, whose bytes are the samples), and nativeFrameOverhead per
 // frame. readNativeFrames refuses PixelData that would cost more than
 // nativeAllocMultiple times its length plus nativeAllocAllowance, before
-// allocator rounding; only frames under about 20 bytes do. Without an exact
-// limit, a frame's bytes over 64 KiB can cost up to twice as much as they
-// arrive (see dicomio.Reader.AppendBytes). nativeFrameOverhead was measured at
-// about 150 bytes: the Frame (48), the NativeFrame (a 64-byte allocation), its
-// slot in PixelDataInfo.Frames, and allocator rounding of a small RawData.
+// allocator rounding; only frames under about 22 bytes do. Without an exact
+// limit, a frame's bytes over 64 KiB can cost up to three times as much as
+// they arrive (see dicomio.Reader.AppendBytes). nativeFrameOverhead was
+// measured at about 180 bytes: the Frame (48), the NativeFrame (a 64-byte
+// allocation), its slot in PixelDataInfo.Frames as append grows it (about
+// 45), and allocator rounding of a small RawData.
 const (
-	nativeFrameOverhead  = 160
+	nativeFrameOverhead  = 200
 	nativeAllocAllowance = 64 << 10
 )
 
@@ -287,6 +288,9 @@ func (r *reader) readHeader() ([]*Element, error) {
 			return nil, ErrorMetaElementGroupLength
 		}
 		metaLen := metaLens[0]
+		if metaLen < 0 {
+			return nil, ErrorMetaElementGroupLength
+		}
 
 		// Read the metadata elements
 		err = r.rawReader.PushLimit(int64(metaLen))
@@ -540,7 +544,7 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 		return nil, 0, fmt.Errorf("readNativeFrames: frames hold no bytes: %w", ErrorInvalidPixelDimensions)
 	}
 	cost := addSaturating(mulSaturating(uint64(nFrames), nativeFrameOverhead), mulSaturating(total, nativeSampleBytes(bitsAllocated)))
-	if bitsAllocated != 8 {
+	if bitsAllocated != 8 && nFrames > 0 {
 		cost = addSaturating(cost, bytesPerFrame)
 	}
 	if cost > nativeAllocMultiple(bitsAllocated)*uint64(vl)+nativeAllocAllowance {
@@ -554,6 +558,7 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 	// declared length the input does not hold costs no more than what it does.
 	image := PixelDataInfo{
 		IsEncapsulated: false,
+		Frames:         []*frame.Frame{},
 	}
 	bo := r.rawReader.ByteOrder()
 	var data []byte
