@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"slices"
 
 	"github.com/suyashkumar/dicom/pkg/charset"
 	"golang.org/x/text/encoding"
@@ -60,11 +59,10 @@ func (r *Reader) BytesLeftUntilLimit() int64 {
 }
 
 // Available returns ErrorInsufficientBytesLeft when n is more than the bytes
-// the Reader can still supply, an early refusal of a declared length before
-// anything is read. Only ReadBytes relies on it to bound an allocation, and
-// only when ExactLimit is true; the limit then is the caller's size, so a
-// caller passing a size larger than its stream holds can be made to allocate
-// up to that size.
+// the Reader can still supply. With an exact limit that refuses a declared
+// length before anything is allocated; AppendBytes depends on it for that. The
+// limit is then the caller's size, so a caller passing a size larger than its
+// stream holds can be made to allocate up to that size.
 func (r *Reader) Available(n int64) error {
 	if n < 0 || n > r.BytesLeftUntilLimit() {
 		return ErrorInsufficientBytesLeft
@@ -76,40 +74,49 @@ func (r *Reader) Available(n int64) error {
 // Available bounds what a read can return.
 func (r *Reader) ExactLimit() bool { return r.exactLimit }
 
-// growChunk is the most ReadBytes allocates for a value before its bytes
+// growChunk is the most AppendBytes allocates for a value before its bytes
 // arrive when the limit is not exact.
 const growChunk = 64 << 10
 
-// ReadBytes reads exactly n bytes. With an exact limit it allocates n once
-// after Available; otherwise the buffer grows as bytes arrive, so a declared
-// length allocates at most a few times the bytes actually read. Like
-// io.ReadFull, it returns io.EOF only if no bytes were read.
+// ReadBytes reads exactly n bytes into a new slice, as AppendBytes does.
 func (r *Reader) ReadBytes(n int64) ([]byte, error) {
+	// Non-nil, so that an empty value stays empty rather than null.
+	return r.AppendBytes([]byte{}, n)
+}
+
+// AppendBytes reads exactly n bytes and appends them to dst. An n past the
+// limit is refused with an error wrapping ErrorInsufficientBytesLeft before
+// anything is read. When dst lacks room, an exact limit allocates once;
+// otherwise the buffer grows as bytes arrive, so a declared length allocates
+// at most about twice the bytes actually read. Like io.ReadFull, it returns
+// io.EOF only if no bytes were read.
+func (r *Reader) AppendBytes(dst []byte, n int64) ([]byte, error) {
 	if err := r.Available(n); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%d bytes declared, %d left: %w", n, r.BytesLeftUntilLimit(), err)
 	}
-	if r.exactLimit || n <= growChunk {
-		data := make([]byte, n)
-		if _, err := io.ReadFull(r, data); err != nil {
-			return nil, err
+	start := int64(len(dst))
+	end := start + n
+	for int64(len(dst)) < end {
+		if len(dst) == cap(dst) {
+			want := end
+			if !r.exactLimit {
+				want = min(end, int64(len(dst))+max(int64(len(dst))-start, growChunk))
+			}
+			// Grown by hand: append's growth overshoots the target.
+			grown := make([]byte, len(dst), want)
+			copy(grown, dst)
+			dst = grown
 		}
-		return data, nil
-	}
-	buf := make([]byte, 0, growChunk)
-	for int64(len(buf)) < n {
-		if len(buf) == cap(buf) {
-			buf = slices.Grow(buf, int(min(int64(len(buf)), n-int64(len(buf)))))
-		}
-		got, err := io.ReadFull(r, buf[len(buf):min(int64(cap(buf)), n)])
-		buf = buf[:len(buf)+got]
+		got, err := io.ReadFull(r, dst[len(dst):min(int64(cap(dst)), end)])
+		dst = dst[:len(dst)+got]
 		if err != nil {
-			if err == io.EOF && len(buf) > 0 {
+			if err == io.EOF && int64(len(dst)) > start {
 				err = io.ErrUnexpectedEOF
 			}
 			return nil, err
 		}
 	}
-	return buf, nil
+	return dst, nil
 }
 
 func (r *Reader) Read(p []byte) (int, error) {

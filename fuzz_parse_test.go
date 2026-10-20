@@ -21,10 +21,9 @@ const (
 	// fuzzAllocBase covers the fixed cost of a parse.
 	fuzzAllocBase = 1 << 20
 	// fuzzAllocPerByte is the most a byte of input may cost once parsed:
-	// one-bit native pixels cost 65 (each bit an int, plus the frame
-	// overhead readNativeFrames allows), and up to an eighth more for
-	// allocator rounding. Elements cost at most about 22.
-	fuzzAllocPerByte = 80
+	// one-bit native pixels cost up to nativeAllocMultiple(1) (73), plus up to
+	// an eighth more for allocator rounding. Elements cost at most about 22.
+	fuzzAllocPerByte = 84
 )
 
 func FuzzParse(f *testing.F) {
@@ -126,24 +125,43 @@ func inflatedSize(data []byte) uint64 {
 	return most
 }
 
-// groupLengthEnd is where the meta group ends by its (0002,0000) value, read
-// as a UL or US, or 0.
+// groupLengthEnd is where the meta group ends by its (0002,0000) value, or 0
+// where the parser takes no group length. As readHeader does, it takes the
+// first value of any integer VR, whose values must fill the element exactly.
 func groupLengthEnd(data []byte, at int) int {
 	if len(data) < at+8 || binary.LittleEndian.Uint16(data[at:]) != 0x0002 || binary.LittleEndian.Uint16(data[at+2:]) != 0 {
 		return 0
 	}
+	vr := string(data[at+4 : at+6])
 	vl := int(binary.LittleEndian.Uint16(data[at+6:]))
 	value := at + 8
-	if len(data) < value+vl {
+	end := value + vl
+	if len(data) < end {
 		return 0
 	}
-	switch vl {
-	case 4:
-		return value + 4 + int(binary.LittleEndian.Uint32(data[value:]))
-	case 2:
-		return value + 2 + int(binary.LittleEndian.Uint16(data[value:]))
+	size := 2
+	if vr == "UL" || vr == "SL" {
+		size = 4
 	}
-	return 0
+	if vl == 0 || vl%size != 0 {
+		return 0
+	}
+	var length int64
+	switch vr {
+	case "UL":
+		length = int64(binary.LittleEndian.Uint32(data[value:]))
+	case "SL":
+		length = int64(int32(binary.LittleEndian.Uint32(data[value:])))
+	case "US", "AT":
+		length = int64(binary.LittleEndian.Uint16(data[value:]))
+	case "SS":
+		length = int64(int16(binary.LittleEndian.Uint16(data[value:])))
+	default:
+		return 0
+	}
+	// A negative length leaves the limit behind the reader, which ends the
+	// group at once.
+	return end + int(max(length, 0))
 }
 
 // metaWalkEnd is where the meta group ends when the parser walks it: past the

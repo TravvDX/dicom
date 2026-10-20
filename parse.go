@@ -257,10 +257,9 @@ func (p *Parser) Next() (*Element, error) {
 	// TODO: add dicom options to only keep track of certain tags
 
 	if elem.Tag == tag.SpecificCharacterSet {
-		encodingNames, ok := elem.Value.GetValue().([]string)
-		if !ok && !p.reader.opts.allowUnknownSpecificCharacterSet {
-			return nil, fmt.Errorf("SpecificCharacterSet has a %T value, not strings: %w", elem.Value.GetValue(), ErrorUnexpectedDataType)
-		}
+		// A value that is not strings (anonymizers write UN or OB) takes the
+		// default character set in every mode.
+		encodingNames, _ := elem.Value.GetValue().([]string)
 		cs, err := charset.ParseSpecificCharacterSet(encodingNames)
 		if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
 			return nil, err
