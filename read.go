@@ -48,18 +48,19 @@ var (
 
 // A native image allocates its samples (the PixelData length, or 64 times it
 // for 1 bit, which unpacks each bit to an int), a buffer for one frame's bytes
-// (none for 8 bits, whose bytes are the samples), and nativeFrameOverhead per
-// frame. readNativeFrames refuses PixelData that would cost more than
-// nativeAllocMultiple times its length plus nativeAllocAllowance, before
-// allocator rounding; only frames under about 22 bytes do. Without an exact
-// limit, a frame's bytes over 64 KiB can cost up to three times as much as
-// they arrive (see dicomio.Reader.AppendBytes). nativeFrameOverhead was
-// measured at about 180 bytes: the Frame (48), the NativeFrame (a 64-byte
-// allocation), its slot in PixelDataInfo.Frames as append grows it (about
-// 45), and allocator rounding of a small RawData.
+// (none for 8 bits under an exact limit, whose bytes are the samples), and
+// nativeFrameOverhead per frame. readNativeFrames refuses PixelData that would
+// cost more than nativeAllocMultiple times its length or nativeAllocAllowance,
+// whichever is larger, before allocator rounding: only many frames under about
+// 22 bytes reach that. Without an exact limit, a frame's bytes over 64 KiB can
+// cost up to three times as much as they arrive (see
+// dicomio.Reader.AppendBytes). nativeFrameOverhead was measured at about 180
+// bytes: the Frame (48), the NativeFrame (a 64-byte allocation), its slot in
+// PixelDataInfo.Frames as append grows it (about 45), and allocator rounding
+// of a small RawData.
 const (
 	nativeFrameOverhead  = 200
-	nativeAllocAllowance = 64 << 10
+	nativeAllocAllowance = 16 << 20
 )
 
 // nativeSampleBytes is what a native sample costs per byte of PixelData.
@@ -543,27 +544,37 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 	if nFrames != 0 && bytesPerFrame == 0 {
 		return nil, 0, fmt.Errorf("readNativeFrames: frames hold no bytes: %w", ErrorInvalidPixelDimensions)
 	}
+	exact := r.rawReader.ExactLimit()
 	cost := addSaturating(mulSaturating(uint64(nFrames), nativeFrameOverhead), mulSaturating(total, nativeSampleBytes(bitsAllocated)))
-	if bitsAllocated != 8 && nFrames > 0 {
+	if (bitsAllocated != 8 || !exact) && nFrames > 0 {
 		cost = addSaturating(cost, bytesPerFrame)
 	}
-	if cost > nativeAllocMultiple(bitsAllocated)*uint64(vl)+nativeAllocAllowance {
+	if cost > max(nativeAllocMultiple(bitsAllocated)*uint64(vl), nativeAllocAllowance) {
 		return nil, 0, fmt.Errorf("readNativeFrames: %d frames of %d bytes: %w", nFrames, bytesPerFrame, ErrorNativeFramesTooSmall)
+	}
+	if exact {
+		if err := r.rawReader.Available(int64(vl)); err != nil {
+			return nil, 0, fmt.Errorf("readNativeFrames: %d bytes declared, %d left: %w", vl, r.rawReader.BytesLeftUntilLimit(), err)
+		}
 	}
 	// total is at most vl here, so it and every factor fit in an int.
 	pixelsPerFrame := rows * cols
 	bytesToRead = int(total)
 
-	// Each frame is allocated only once its bytes have been read, so a
-	// declared length the input does not hold costs no more than what it does.
+	// Without an exact limit, each frame is allocated only once its bytes
+	// have been read, so a declared length the input does not hold costs no
+	// more than what it does.
 	image := PixelDataInfo{
 		IsEncapsulated: false,
 		Frames:         []*frame.Frame{},
 	}
+	if exact {
+		image.Frames = make([]*frame.Frame, 0, nFrames)
+	}
 	bo := r.rawReader.ByteOrder()
 	var data []byte
 	for frameIdx := 0; frameIdx < nFrames; frameIdx++ {
-		if bitsAllocated == 8 {
+		if bitsAllocated == 8 && exact {
 			data, err = r.rawReader.ReadBytes(int64(bytesPerFrame))
 		} else {
 			data, err = r.rawReader.AppendBytes(data[:0], int64(bytesPerFrame))
@@ -582,11 +593,15 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 			}
 			currentFrame.NativeData = nativeFrame
 		case 8:
+			raw := data
+			if !exact {
+				raw = bytes.Clone(data)
+			}
 			currentFrame.NativeData = &frame.NativeFrame[uint8]{
 				InternalBitsPerSample:   bitsAllocated,
 				InternalRows:            rows,
 				InternalCols:            cols,
-				RawData:                 data,
+				RawData:                 raw,
 				InternalSamplesPerPixel: samplesPerPixel,
 			}
 		case 16:

@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/suyashkumar/dicom/pkg/charset"
 	"github.com/suyashkumar/dicom/pkg/debug"
@@ -176,7 +177,7 @@ func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, 
 			// Implicit here?
 			debug.Log("WARN: could not parse transfer syntax uid in metadata")
 		}
-		if tsStr == uid.DeflatedExplicitVRLittleEndian {
+		if canonical, _ := uid.CanonicalTransferSyntaxUID(tsStr); canonical == uid.DeflatedExplicitVRLittleEndian {
 			p.reader.rawReader.SetDeflate()
 		}
 		p.SetTransferSyntax(bo, implicit)
@@ -257,18 +258,37 @@ func (p *Parser) Next() (*Element, error) {
 	// TODO: add dicom options to only keep track of certain tags
 
 	if elem.Tag == tag.SpecificCharacterSet {
-		// A value that is not strings (anonymizers write UN or OB) takes the
-		// default character set in every mode.
-		encodingNames, _ := elem.Value.GetValue().([]string)
-		cs, err := charset.ParseSpecificCharacterSet(encodingNames)
-		if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
-			return nil, err
+		var cs charset.CodingSystem
+		switch v := elem.Value.GetValue().(type) {
+		case []string:
+			cs, err = charset.ParseSpecificCharacterSet(v)
+			if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
+				return nil, err
+			}
+		case []byte:
+			// Anonymizers write the value as UN or OB. Bytes that name no
+			// known character set take the default in every mode.
+			cs, _ = charset.ParseSpecificCharacterSet(characterSetNames(v))
 		}
 		p.reader.rawReader.SetCodingSystem(cs)
 	}
 
 	p.dataset.Elements = append(p.dataset.Elements, elem)
 	return elem, nil
+}
+
+// characterSetNames reads a SpecificCharacterSet value held as bytes as the
+// CS string it encodes.
+func characterSetNames(b []byte) []string {
+	s := strings.TrimRight(string(b), " \x00")
+	if s == "" {
+		return nil
+	}
+	names := strings.Split(s, "\\")
+	for i, n := range names {
+		names[i] = strings.TrimSpace(n)
+	}
+	return names
 }
 
 // GetMetadata returns just the set of metadata elements that have been parsed

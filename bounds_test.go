@@ -471,6 +471,36 @@ func TestParse_SpecificCharacterSetOfTheWrongType(t *testing.T) {
 	}
 }
 
+func TestParse_SpecificCharacterSetAsBytesApplies(t *testing.T) {
+	latin1Name := []byte{'J', 'O', 'S', 0xc9} // JOSÉ in ISO_IR 100
+	cases := map[string]struct {
+		value []byte
+		want  string
+	}{
+		"ISO_IR 100":                {[]byte("ISO_IR 100"), "JOSÉ"},
+		"padded with a NUL":         {[]byte("ISO_IR 100\x00"), "JOSÉ"},
+		"padded with a space":       {[]byte("ISO_IR 100 "), "JOSÉ"},
+		"first of two values":       {[]byte("ISO_IR 100\\ISO_IR 100 "), "JOSÉ"},
+		"unknown takes the default": {[]byte("NOT A SET "), string(latin1Name)},
+	}
+	for name, tc := range cases {
+		for _, vr := range []string{"OB", "UN"} {
+			data := explicitFile(
+				explicitElem(tag.SpecificCharacterSet, vr, uint32(len(tc.value)), tc.value),
+				explicitElem(tag.PatientName, "PN", uint32(len(latin1Name)), latin1Name),
+			)
+			ds, err := parseBounded(t, data, maxBoundedAlloc)
+			if err != nil {
+				t.Errorf("%s as %s: Parse error = %v", name, vr, err)
+				continue
+			}
+			if e, err := ds.FindElementByTag(tag.PatientName); err != nil || MustGetStrings(e.Value)[0] != tc.want {
+				t.Errorf("%s as %s: PatientName = %v (%v), want %q", name, vr, e, err, tc.want)
+			}
+		}
+	}
+}
+
 func TestParse_NestingWithinLimit(t *testing.T) {
 	cases := []struct {
 		name string
@@ -667,12 +697,14 @@ func TestParse_NativeFramesAllocationMultiple(t *testing.T) {
 		{name: "1-bit 24x8", image: nativeImage(24, 8, 1, 1, "4096"), vl: 24 * 4096, multiple: 73},
 		{name: "1-bit 16x16 segmentation", image: nativeImage(16, 16, 1, 1, "2000"), vl: 32 * 2000, multiple: 73},
 		{name: "tiny frames within the allowance", image: nativeImage(1, 1, 8, 1, "300 "), vl: 300, multiple: 10},
+		{name: "1-bit 4x4 segmentation, 500 frames", image: nativeImage(4, 4, 1, 1, "500 "), vl: 2 * 500, multiple: 73},
+		{name: "16-bit 1x8, 2000 frames", image: nativeImage(1, 8, 16, 1, "2000"), vl: 16 * 2000, multiple: 10},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			data := explicitFile(tc.image, explicitElem(tag.PixelData, "OW", uint32(tc.vl), make([]byte, tc.vl)))
 			// 64 KiB covers the rest of the parse.
-			limit := uint64(tc.multiple*tc.vl + nativeAllocAllowance + 64<<10)
+			limit := uint64(max(tc.multiple*tc.vl, nativeAllocAllowance) + 128<<10)
 			if _, err := parseBounded(t, data, limit); err != nil {
 				t.Errorf("Parse error = %v", err)
 			}
@@ -742,6 +774,31 @@ func TestParse_NativeFramesAllocateAsRead(t *testing.T) {
 			t.Errorf("Parse error = %v", err)
 		}
 	})
+	t.Run("8-bit until EOF", func(t *testing.T) {
+		data := explicitFile(nativeImage(512, 512, 8, 1, "32"), explicitElem(tag.PixelData, "OW", vl, make([]byte, vl)))
+		// The frames, one frame buffer grown as its bytes arrive, and 1 MiB.
+		const limit = vl + 3*512*512 + 1<<20
+		allocated := bytesAllocated(func() {
+			if _, err := ParseUntilEOF(bytes.NewReader(data), nil); err != nil {
+				t.Errorf("ParseUntilEOF error = %v", err)
+			}
+		})
+		if allocated > limit {
+			t.Errorf("ParseUntilEOF allocated %d bytes, want at most %d", allocated, limit)
+		}
+	})
+	t.Run("an exact limit refuses a truncation before any frame", func(t *testing.T) {
+		const frameBytes = 512 * 512 * 2
+		data := explicitFile(nativeImage(512, 512, 16, 1, "4 "), explicitElem(tag.PixelData, "OW", 4*frameBytes, make([]byte, 2*frameBytes+10)))
+		fc := make(chan *frame.Frame, 4)
+		_, err := Parse(bytes.NewReader(data), int64(len(data)), fc)
+		if !errors.Is(err, dicomio.ErrorInsufficientBytesLeft) {
+			t.Errorf("Parse error = %v, want %v", err, dicomio.ErrorInsufficientBytesLeft)
+		}
+		if got := len(fc); got != 0 {
+			t.Errorf("frame channel received %d frames, want none", got)
+		}
+	})
 	t.Run("frames before a truncation reach the channel", func(t *testing.T) {
 		const frameBytes = 512 * 512 * 2
 		data := explicitFile(nativeImage(512, 512, 16, 1, "4 "), explicitElem(tag.PixelData, "OW", 4*frameBytes, make([]byte, 2*frameBytes+10)))
@@ -797,11 +854,12 @@ func TestParse_IntAndFloatErrorsNameTheElement(t *testing.T) {
 	}
 }
 
-func TestParse_TransferSyntaxesMissingFromTheUIDList(t *testing.T) {
+func TestParse_ExplicitVRLittleEndianTransferSyntaxes(t *testing.T) {
 	for _, ts := range []string{
-		"1.2.840.10008.1.2.4.201", "1.2.840.10008.1.2.4.202", "1.2.840.10008.1.2.4.203", // HTJ2K
+		"1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2.4.70", "1.2.840.10008.1.2.4.90", "1.2.840.10008.1.2.5", // in the uid list
+		"1.2.840.10008.1.2.4.201", "1.2.840.10008.1.2.4.202", "1.2.840.10008.1.2.4.203", "1.2.840.10008.1.2.4.204", // HTJ2K
 		"1.2.840.10008.1.2.4.110", "1.2.840.10008.1.2.4.111", "1.2.840.10008.1.2.4.112", // JPEG XL
-		"1.2.840.10008.1.2.1.98", "1.2.840.10008.1.2.8.1",
+		"1.2.840.10008.1.2.1.98", "1.2.840.10008.1.2.8.1", "1.2.840.10008.1.2.4.999",
 	} {
 		t.Run(ts, func(t *testing.T) {
 			data := dicomFile(ts, cat(
@@ -833,19 +891,47 @@ func TestParse_TransferSyntaxesMissingFromTheUIDList(t *testing.T) {
 	}
 }
 
-func TestParse_UnreadableTransferSyntaxesAreRefused(t *testing.T) {
-	for ts, want := range map[string]string{
-		"1.2.840.10008.1.2.4.95":  "deflates the dataset",
-		"1.2.840.10008.1.2.4.205": "deflates the dataset",
-		"1.2.840.10008.1.2.4.999": "1.2.840.10008.1.2.4.999",
-	} {
+func TestParse_DatasetDeflatingTransferSyntaxesInflate(t *testing.T) {
+	for _, ts := range []string{"1.2.840.10008.1.2.4.95", "1.2.840.10008.1.2.4.205"} {
 		t.Run(ts, func(t *testing.T) {
 			data := dicomFile(ts, deflate(explicitElem(tag.PatientName, "PN", 4, []byte("ABCD"))))
-			_, err := parseBounded(t, data, maxBoundedAlloc)
-			if err == nil || !strings.Contains(err.Error(), want) {
-				t.Errorf("Parse error = %v, want one containing %q", err, want)
+			ds, err := parseBounded(t, data, maxBoundedAlloc)
+			if err != nil {
+				t.Fatalf("Parse error = %v", err)
+			}
+			e, err := ds.FindElementByTag(tag.PatientName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := MustGetStrings(e.Value); len(got) != 1 || got[0] != "ABCD" {
+				t.Errorf("PatientName = %v, want ABCD", got)
 			}
 		})
+	}
+}
+
+func TestParse_NonStandardTransferSyntaxIsRefused(t *testing.T) {
+	data := dicomFile("1.2.3.4", explicitElem(tag.PatientName, "PN", 4, []byte("ABCD")))
+	if _, err := parseBounded(t, data, maxBoundedAlloc); err == nil || !strings.Contains(err.Error(), "1.2.3.4") {
+		t.Errorf("Parse error = %v, want one naming 1.2.3.4", err)
+	}
+}
+
+func TestDatasetTransferSyntax_JPIPReferencedDeflate(t *testing.T) {
+	ds := Dataset{Elements: []*Element{
+		mustNewElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
+		mustNewElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.3.4.5.6.7"}),
+		mustNewElement(tag.TransferSyntaxUID, []string{"1.2.840.10008.1.2.4.95"}),
+		mustNewElement(tag.PatientName, []string{"ABCD"}),
+	}}
+	bo, implicit, err := ds.transferSyntax()
+	if err != nil || bo != binary.LittleEndian || implicit {
+		t.Errorf("transferSyntax() = %v, %v, %v; want little endian, explicit, nil", bo, implicit, err)
+	}
+	// As before, only Deflated Explicit VR Little Endian is refused; 4.95 is
+	// written uncompressed.
+	if err := Write(&bytes.Buffer{}, ds); err != nil {
+		t.Errorf("Write error = %v", err)
 	}
 }
 

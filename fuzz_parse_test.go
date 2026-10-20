@@ -23,6 +23,8 @@ const (
 	// fuzzAllocPerByte is the most a byte of input may cost once parsed:
 	// one-bit native pixels cost up to nativeAllocMultiple(1) (73), plus up to
 	// an eighth more for allocator rounding. Elements cost at most about 22.
+	// Native PixelData may instead cost up to nativeAllocAllowance whatever
+	// its length, plus the same rounding.
 	fuzzAllocPerByte = 84
 )
 
@@ -35,6 +37,7 @@ func FuzzParse(f *testing.F) {
 	f.Add(explicitFile(nativeImage(2, 4, 1, 1, "2 "), explicitElem(tag.PixelData, "OW", 2, []byte{0xaa, 0x55})))
 	f.Add(explicitFile(nativeImage(2, 2, 16, 1, "1 "), explicitElem(tag.PixelData, "OW", 8, make([]byte, 8))))
 	f.Add(deflatedFile(explicitElem(tag.PatientName, "PN", 4, []byte("ABCD"))))
+	f.Add(dicomFile("1.2.840.10008.1.2.4.95", deflate(explicitElem(tag.PatientName, "PN", 4, []byte("ABCD")))))
 	for _, tc := range untrustedLimitCases {
 		f.Add(deflatedFile(tc.body))
 	}
@@ -64,10 +67,13 @@ func FuzzParse(f *testing.F) {
 		// A deflated input is bounded by what it inflates to, not by the most
 		// it could.
 		read := uint64(len(data))
-		if bytes.Contains(data, []byte(uid.DeflatedExplicitVRLittleEndian)) {
-			read += inflatedSize(data)
+		for _, ts := range []string{uid.DeflatedExplicitVRLittleEndian, "1.2.840.10008.1.2.4.95", "1.2.840.10008.1.2.4.205"} {
+			if bytes.Contains(data, []byte(ts)) {
+				read += inflatedSize(data)
+				break
+			}
 		}
-		limit := fuzzAllocBase + fuzzAllocPerByte*read
+		limit := fuzzAllocBase + max(fuzzAllocPerByte*read, nativeAllocAllowance*9/8)
 		allocated := bytesAllocated(func() {
 			_, _ = ParseUntilEOF(bytes.NewReader(data), nil)
 		})
