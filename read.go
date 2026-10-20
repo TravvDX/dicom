@@ -50,9 +50,9 @@ var (
 // for 1 bit, which unpacks each bit to an int), a buffer for one frame's bytes
 // (none for 8 bits under an exact limit, whose bytes are the samples), and
 // nativeFrameOverhead per frame. readNativeFrames refuses PixelData that would
-// cost more than nativeAllocMultiple times its length or nativeAllocAllowance,
-// whichever is larger, before allocator rounding: only many frames under about
-// 22 bytes reach that. Without an exact limit, a frame's bytes over 64 KiB can
+// cost more than nativeAllocMultiple times its length plus what is left of
+// nativeAllocAllowance, which one parse shares across its native images, before
+// allocator rounding: only many frames under about 22 bytes reach that. Without an exact limit, a frame's bytes over 64 KiB can
 // cost up to three times as much as they arrive (see
 // dicomio.Reader.AppendBytes). nativeFrameOverhead was measured at about 180
 // bytes: the Frame (48), the NativeFrame (a 64-byte allocation), its slot in
@@ -87,6 +87,11 @@ type reader struct {
 	opts      parseOptSet
 	// depth counts the sequences and items open around the element being read.
 	depth int
+	// nativeAllowanceUsed is how much of nativeAllocAllowance this parse's
+	// native images have taken beyond their nativeAllocMultiple. The
+	// allowance is per parse: a dataset can hold any number of PixelData
+	// elements sharing one set of dimensions.
+	nativeAllowanceUsed uint64
 }
 
 // enterNesting is called on entry to every sequence and item, before reading
@@ -549,8 +554,12 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 	if (bitsAllocated != 8 || !exact) && nFrames > 0 {
 		cost = addSaturating(cost, bytesPerFrame)
 	}
-	if cost > max(nativeAllocMultiple(bitsAllocated)*uint64(vl), nativeAllocAllowance) {
-		return nil, 0, fmt.Errorf("readNativeFrames: %d frames of %d bytes: %w", nFrames, bytesPerFrame, ErrorNativeFramesTooSmall)
+	if base := nativeAllocMultiple(bitsAllocated) * uint64(vl); cost > base {
+		over := cost - base
+		if over > nativeAllocAllowance-r.nativeAllowanceUsed {
+			return nil, 0, fmt.Errorf("readNativeFrames: %d frames of %d bytes: %w", nFrames, bytesPerFrame, ErrorNativeFramesTooSmall)
+		}
+		r.nativeAllowanceUsed += over
 	}
 	if exact {
 		if err := r.rawReader.Available(int64(vl)); err != nil {

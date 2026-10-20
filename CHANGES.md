@@ -18,7 +18,8 @@ and malformed header values return errors instead of panicking.
   no value return `ErrorInvalidPixelDimensions` (missing Rows, Columns,
   BitsAllocated or SamplesPerPixel return `ErrorElementNotFound`, as before)
   instead of panicking. Frames so small that the image would cost more than
-  `max(10x the PixelData length (73x for 1 bit), 16 MiB)` return
+  10x the PixelData length (73x for 1 bit), plus what is left of a 16 MiB
+  allowance each parse shares across its images, return
   `ErrorNativeFramesTooSmall`. Under an exact size, truncated PixelData is
   refused before any frame is decoded or sent on the frame channel.
 - SpecificCharacterSet written as bytes (VR UN or OB, as anonymizers do) is

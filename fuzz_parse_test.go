@@ -23,8 +23,8 @@ const (
 	// fuzzAllocPerByte is the most a byte of input may cost once parsed:
 	// one-bit native pixels cost up to nativeAllocMultiple(1) (73), plus up to
 	// an eighth more for allocator rounding. Elements cost at most about 22.
-	// Native PixelData may instead cost up to nativeAllocAllowance whatever
-	// its length, plus the same rounding.
+	// Native PixelData may cost up to nativeAllocAllowance on top, once per
+	// parse, plus the same rounding.
 	fuzzAllocPerByte = 84
 )
 
@@ -73,7 +73,7 @@ func FuzzParse(f *testing.F) {
 				break
 			}
 		}
-		limit := fuzzAllocBase + max(fuzzAllocPerByte*read, nativeAllocAllowance*9/8)
+		limit := fuzzAllocBase + fuzzAllocPerByte*read + nativeAllocAllowance*9/8
 		allocated := bytesAllocated(func() {
 			_, _ = ParseUntilEOF(bytes.NewReader(data), nil)
 		})

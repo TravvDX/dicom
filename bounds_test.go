@@ -651,6 +651,21 @@ func TestParse_DeflatedValuesParse(t *testing.T) {
 	}
 }
 
+// The allowance is shared by every PixelData element of one parse.
+func TestParse_NativeAllowanceIsPerParse(t *testing.T) {
+	const frames = 80000
+	px := explicitElem(tag.PixelData, "OW", frames, make([]byte, frames))
+	data := explicitFile(nativeImage(1, 1, 8, 1, "80000"), px, px, px, px)
+	limit := uint64(fuzzAllocBase + fuzzAllocPerByte*len(data) + nativeAllocAllowance*9/8)
+	if _, err := parseBounded(t, data, limit); !errors.Is(err, ErrorNativeFramesTooSmall) {
+		t.Errorf("Parse error = %v, want %v", err, ErrorNativeFramesTooSmall)
+	}
+	allocated := bytesAllocated(func() { _, _ = ParseUntilEOF(bytes.NewReader(data), nil) })
+	if allocated > limit {
+		t.Errorf("ParseUntilEOF allocated %d bytes, want at most %d", allocated, limit)
+	}
+}
+
 func TestParse_NativeFramesTooSmallAreRefused(t *testing.T) {
 	const frames = 1 << 20
 	cases := []struct {
@@ -688,6 +703,7 @@ func TestParse_NativeFramesAllocationMultiple(t *testing.T) {
 		image    []byte
 		vl       int
 		multiple int
+		frames   int
 	}{
 		{name: "8-bit 4x6", image: nativeImage(4, 6, 8, 1, "4096"), vl: 24 * 4096, multiple: 10},
 		{name: "8-bit 1x23, many frames", image: nativeImage(1, 23, 8, 1, "200000"), vl: 23 * 200000, multiple: 10},
@@ -696,15 +712,17 @@ func TestParse_NativeFramesAllocationMultiple(t *testing.T) {
 		{name: "8-bit RGB 512x512", image: nativeImage(512, 512, 8, 3, "2 "), vl: 512 * 512 * 3 * 2, multiple: 10},
 		{name: "1-bit 24x8", image: nativeImage(24, 8, 1, 1, "4096"), vl: 24 * 4096, multiple: 73},
 		{name: "1-bit 16x16 segmentation", image: nativeImage(16, 16, 1, 1, "2000"), vl: 32 * 2000, multiple: 73},
-		{name: "tiny frames within the allowance", image: nativeImage(1, 1, 8, 1, "300 "), vl: 300, multiple: 10},
-		{name: "1-bit 4x4 segmentation, 500 frames", image: nativeImage(4, 4, 1, 1, "500 "), vl: 2 * 500, multiple: 73},
-		{name: "16-bit 1x8, 2000 frames", image: nativeImage(1, 8, 16, 1, "2000"), vl: 16 * 2000, multiple: 10},
+		{name: "tiny frames within the allowance", image: nativeImage(1, 1, 8, 1, "300 "), vl: 300, multiple: 10, frames: 300},
+		{name: "1-bit 4x4 segmentation, 500 frames", image: nativeImage(4, 4, 1, 1, "500 "), vl: 2 * 500, multiple: 73, frames: 500},
+		{name: "16-bit 1x8, 2000 frames", image: nativeImage(1, 8, 16, 1, "2000"), vl: 16 * 2000, multiple: 10, frames: 2000},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			data := explicitFile(tc.image, explicitElem(tag.PixelData, "OW", uint32(tc.vl), make([]byte, tc.vl)))
 			// 64 KiB covers the rest of the parse.
-			limit := uint64(max(tc.multiple*tc.vl, nativeAllocAllowance) + 128<<10)
+			// Frames past the multiple cost their overhead, samples and
+			// frame buffer, from the allowance.
+			limit := uint64(max(tc.multiple*tc.vl, tc.frames*nativeFrameOverhead+(tc.multiple-8)*tc.vl) + 128<<10)
 			if _, err := parseBounded(t, data, limit); err != nil {
 				t.Errorf("Parse error = %v", err)
 			}
