@@ -40,6 +40,7 @@ func FuzzParse(f *testing.F) {
 		f.Add(deflatedFile(tc.body))
 	}
 	f.Add(explicitFile(nativeImage(1, 1, 8, 1, "4096"), explicitElem(tag.PixelData, "OW", 4096, make([]byte, 4096))))
+	f.Add(withUSGroupLength(deflatedFile(nativeImage(1024, 1024, 1, 1, "1 "), explicitElem(tag.PixelData, "OW", 1024*1024/8, make([]byte, 1024*1024/8)))))
 	for _, name := range []string{"1.dcm", "2.dcm", "3.dcm", "6.dcm"} {
 		addSeedFile(f, filepath.Join("testdata", name))
 	}
@@ -92,17 +93,65 @@ func addSeedFile(f *testing.F, path string) {
 	f.Add(data)
 }
 
-// inflatedSize is how many bytes the deflated dataset after data's file meta
-// group inflates to, or 0 if data has no meta group length to find it by.
+// withUSGroupLength rewrites dicomFile's UL group length as a US, which the
+// parser also accepts.
+func withUSGroupLength(data []byte) []byte {
+	const at = 128 + 4
+	length := binary.LittleEndian.Uint32(data[at+8:])
+	return cat(data[:at], explicitElem(tag.FileMetaInformationGroupLength, "US", 2, us(uint16(length))), data[at+12:])
+}
+
+// inflatedSize is the most the dataset after data's file meta group
+// inflates to, trying both ends the parser may take for that group: the one
+// its group length gives, and the one walking its group 0002 elements finds.
 func inflatedSize(data []byte) uint64 {
-	const lengthValue = 128 + 4 + 8 // preamble, magic word, group length header
-	if len(data) < lengthValue+4 {
+	const metaStart = 128 + 4 // preamble, magic word
+	var most uint64
+	for _, start := range []int{groupLengthEnd(data, metaStart), metaWalkEnd(data, metaStart)} {
+		if start <= 0 || start > len(data) {
+			continue
+		}
+		n, _ := io.Copy(io.Discard, flate.NewReader(bytes.NewReader(data[start:])))
+		most = max(most, uint64(n))
+	}
+	return most
+}
+
+// groupLengthEnd is where the meta group ends by its (0002,0000) value, read
+// as a UL or US, or 0.
+func groupLengthEnd(data []byte, at int) int {
+	if len(data) < at+8 || binary.LittleEndian.Uint16(data[at:]) != 0x0002 || binary.LittleEndian.Uint16(data[at+2:]) != 0 {
 		return 0
 	}
-	start := uint64(lengthValue+4) + uint64(binary.LittleEndian.Uint32(data[lengthValue:]))
-	if start > uint64(len(data)) {
+	vl := int(binary.LittleEndian.Uint16(data[at+6:]))
+	value := at + 8
+	if len(data) < value+vl {
 		return 0
 	}
-	n, _ := io.Copy(io.Discard, flate.NewReader(bytes.NewReader(data[start:])))
-	return uint64(n)
+	switch vl {
+	case 4:
+		return value + 4 + int(binary.LittleEndian.Uint32(data[value:]))
+	case 2:
+		return value + 2 + int(binary.LittleEndian.Uint16(data[value:]))
+	}
+	return 0
+}
+
+// metaWalkEnd is where the explicit VR group 0002 elements from at end.
+func metaWalkEnd(data []byte, at int) int {
+	for len(data) >= at+8 && binary.LittleEndian.Uint16(data[at:]) == 0x0002 {
+		vr := string(data[at+4 : at+6])
+		if longVRs[vr] {
+			if len(data) < at+12 {
+				return 0
+			}
+			at += 12 + int(binary.LittleEndian.Uint32(data[at+8:]))
+		} else {
+			at += 8 + int(binary.LittleEndian.Uint16(data[at+6:]))
+		}
+		if at < 0 {
+			return 0
+		}
+	}
+	return at
 }

@@ -538,10 +538,11 @@ func (r *reader) readNativeFrames(parsedData *Dataset, fc chan<- *frame.Frame, v
 	pixelsPerFrame := rows * cols
 	bytesToRead = int(total)
 	src := r.rawReader
-	if err := src.Available(int64(vl)); err != nil {
-		return nil, 0, fmt.Errorf("readNativeFrames: %w", err)
-	}
-	if !src.ExactLimit() {
+	if src.ExactLimit() {
+		if err := src.Available(int64(vl)); err != nil {
+			return nil, 0, fmt.Errorf("readNativeFrames: %w", err)
+		}
+	} else {
 		// Frames are allocated from the dimensions before their pixels are
 		// read, which only Available bounds, so read the bytes first.
 		data, err := src.ReadBytes(int64(vl))
@@ -773,9 +774,10 @@ func (r *reader) readBytes(t tag.Tag, vr string, vl uint32) (Value, error) {
 		}
 		// Words are kept little endian whatever the transfer syntax.
 		// TODO: support bytes.BigEndian byte ordering
-		bo := r.rawReader.ByteOrder()
-		for i := 0; i+1 < len(data); i += 2 {
-			binary.LittleEndian.PutUint16(data[i:], bo.Uint16(data[i:]))
+		if bo := r.rawReader.ByteOrder(); bo != binary.LittleEndian {
+			for i := 0; i+1 < len(data); i += 2 {
+				binary.LittleEndian.PutUint16(data[i:], bo.Uint16(data[i:]))
+			}
 		}
 		return &bytesValue{value: data}, nil
 	}

@@ -259,7 +259,7 @@ func (p *Parser) Next() (*Element, error) {
 	if elem.Tag == tag.SpecificCharacterSet {
 		encodingNames, ok := elem.Value.GetValue().([]string)
 		if !ok && !p.reader.opts.allowUnknownSpecificCharacterSet {
-			return nil, fmt.Errorf("SpecificCharacterSet has a %v value, not strings: %w", elem.Value.ValueType(), ErrorUnexpectedDataType)
+			return nil, fmt.Errorf("SpecificCharacterSet has a %T value, not strings: %w", elem.Value.GetValue(), ErrorUnexpectedDataType)
 		}
 		cs, err := charset.ParseSpecificCharacterSet(encodingNames)
 		if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
