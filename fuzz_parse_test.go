@@ -40,6 +40,7 @@ func FuzzParse(f *testing.F) {
 		f.Add(deflatedFile(tc.body))
 	}
 	f.Add(explicitFile(nativeImage(1, 1, 8, 1, "4096"), explicitElem(tag.PixelData, "OW", 4096, make([]byte, 4096))))
+	f.Add(withoutGroupLength(deflatedFile(nativeImage(1024, 1024, 1, 1, "1 "), explicitElem(tag.PixelData, "OW", 1024*1024/8, make([]byte, 1024*1024/8)))))
 	f.Add(withUSGroupLength(deflatedFile(nativeImage(1024, 1024, 1, 1, "1 "), explicitElem(tag.PixelData, "OW", 1024*1024/8, make([]byte, 1024*1024/8)))))
 	for _, name := range []string{"1.dcm", "2.dcm", "3.dcm", "6.dcm"} {
 		addSeedFile(f, filepath.Join("testdata", name))
@@ -101,6 +102,14 @@ func withUSGroupLength(data []byte) []byte {
 	return cat(data[:at], explicitElem(tag.FileMetaInformationGroupLength, "US", 2, us(uint16(length))), data[at+12:])
 }
 
+// withoutGroupLength puts another group's element where dicomFile's group
+// length was, so that the parser, with AllowMissingMetaElementGroupLength,
+// reads it and walks the meta group after it.
+func withoutGroupLength(data []byte) []byte {
+	const at = 128 + 4
+	return cat(data[:at], explicitElem(tag.Tag{Group: 0x0077, Element: 0x0000}, "CS", 2, []byte("AB")), data[at+12:])
+}
+
 // inflatedSize is the most the dataset after data's file meta group
 // inflates to, trying both ends the parser may take for that group: the one
 // its group length gives, and the one walking its group 0002 elements finds.
@@ -137,9 +146,10 @@ func groupLengthEnd(data []byte, at int) int {
 	return 0
 }
 
-// metaWalkEnd is where the explicit VR group 0002 elements from at end.
+// metaWalkEnd is where the meta group ends when the parser walks it: past the
+// first element, whatever its group, then past each group 0002 element.
 func metaWalkEnd(data []byte, at int) int {
-	for len(data) >= at+8 && binary.LittleEndian.Uint16(data[at:]) == 0x0002 {
+	for first := true; len(data) >= at+8 && (first || binary.LittleEndian.Uint16(data[at:]) == 0x0002); first = false {
 		vr := string(data[at+4 : at+6])
 		if longVRs[vr] {
 			if len(data) < at+12 {
