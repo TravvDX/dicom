@@ -1,6 +1,7 @@
 package dicom
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"math/rand"
 	"os"
 	"runtime"
 	"testing"
@@ -449,8 +451,11 @@ func TestParse_SpecificCharacterSetOfTheWrongType(t *testing.T) {
 		explicitElem(tag.SpecificCharacterSet, "US", 2, us(1)),
 		explicitElem(tag.PatientName, "PN", 4, []byte("ABCD")),
 	)
-	if _, err := parseBounded(t, data, maxBoundedAlloc); err != nil {
-		t.Errorf("Parse error = %v, want the default character set", err)
+	if _, err := parseBounded(t, data, maxBoundedAlloc); !errors.Is(err, ErrorUnexpectedDataType) {
+		t.Errorf("Parse error = %v, want %v", err, ErrorUnexpectedDataType)
+	}
+	if _, err := parseBounded(t, data, maxBoundedAlloc, AllowUnknownSpecificCharacterSet()); err != nil {
+		t.Errorf("AllowUnknownSpecificCharacterSet: Parse error = %v, want the default character set", err)
 	}
 }
 
@@ -505,5 +510,220 @@ func TestParse_TestdataUnchangedFromUpstream(t *testing.T) {
 				t.Errorf("parsed JSON sha256 = %s, want %s", got, want)
 			}
 		})
+	}
+}
+
+// incompressible returns n bytes deflate cannot shrink, so that a deflated
+// input's limit (1032 times its compressed bytes) is far above what it holds.
+func incompressible(n int) []byte {
+	b := make([]byte, n)
+	rand.New(rand.NewSource(1)).Read(b)
+	return b
+}
+
+// untrustedLimitCases declare lengths within the limit of a reader that
+// cannot bound them: one with no size, or one reading deflated input.
+var untrustedLimitCases = []struct {
+	name string
+	body []byte
+	opts []ParseOption
+	// parses is set where upstream ends the parse without an error: ints
+	// and floats stop at the end of the input, and encapsulated PixelData
+	// ends its frames.
+	parses bool
+}{
+	{name: "string", body: explicitElem(tag.TextValue, "UT", 4<<20, incompressible(8<<10))},
+	{name: "OB", body: explicitElem(privateBytesTag, "OB", 4<<20, incompressible(8<<10))},
+	{name: "OW", body: explicitElem(privateBytesTag, "OW", 4<<20, incompressible(8<<10))},
+	{name: "UN", body: explicitElem(privateUnknownTag, "UN", 4<<20, incompressible(8<<10))},
+	{name: "US", body: explicitElem(tag.Rows, "US", 0xfffe, incompressible(8<<10)), parses: true},
+	{name: "FD", body: explicitElem(tag.TimeRange, "FD", 0xfff8, incompressible(8<<10)), parses: true},
+	{
+		name: "undefined length OB item",
+		body: cat(explicitElem(privateBytesTag, "OB", tag.VLUndefinedLength, nil), implicitElem(tag.Item, 4<<20, incompressible(8<<10))),
+	},
+	{
+		name:   "encapsulated frame",
+		body:   cat(explicitElem(tag.PixelData, "OB", tag.VLUndefinedLength, nil), implicitElem(tag.Item, 0, nil), implicitElem(tag.Item, 4<<20, incompressible(8<<10))),
+		parses: true,
+	},
+	{
+		name: "unprocessed PixelData",
+		body: explicitElem(tag.PixelData, "OW", 4<<20, incompressible(8<<10)),
+		opts: []ParseOption{SkipProcessingPixelDataValue()},
+	},
+	{
+		name: "mismatched PixelData",
+		body: cat(nativeImage(2, 2, 8, 1, "1 "), explicitElem(tag.PixelData, "OW", 4<<20, incompressible(8<<10))),
+		opts: []ParseOption{AllowMismatchPixelDataLength()},
+	},
+	{
+		name: "native PixelData matching its dimensions",
+		body: cat(nativeImage(1024, 1024, 8, 1, "4 "), explicitElem(tag.PixelData, "OW", 4<<20, incompressible(8<<10))),
+	},
+}
+
+// A declared length the reader cannot check allocates no more than a few
+// times what the input actually holds.
+func TestParse_UntrustedLimitAllocatesFromBytesRead(t *testing.T) {
+	for _, tc := range untrustedLimitCases {
+		t.Run(tc.name+"/until EOF", func(t *testing.T) {
+			data := explicitFile(tc.body)
+			var err error
+			allocated := bytesAllocated(func() {
+				_, err = ParseUntilEOF(bytes.NewReader(data), nil, tc.opts...)
+			})
+			if limit := uint64(maxBoundedAlloc + 3*len(data)); allocated > limit {
+				t.Errorf("ParseUntilEOF of a %d byte input allocated %d bytes, want at most %d", len(data), allocated, limit)
+			}
+			if (err == nil) != tc.parses {
+				t.Errorf("ParseUntilEOF error = %v", err)
+			}
+		})
+		t.Run(tc.name+"/deflated", func(t *testing.T) {
+			data := deflatedFile(tc.body)
+			_, err := parseBounded(t, data, uint64(maxBoundedAlloc+3*len(tc.body)), tc.opts...)
+			if (err == nil) != tc.parses {
+				t.Errorf("Parse error = %v", err)
+			}
+		})
+	}
+}
+
+func TestParse_DeflatedValuesParse(t *testing.T) {
+	value := bytes.Repeat([]byte("ABCDEFGH"), 64<<10)
+	data := deflatedFile(explicitElem(privateBytesTag, "OB", uint32(len(value)), value), explicitElem(tag.PatientName, "PN", 4, []byte("ABCD")))
+	ds, err := parseBounded(t, data, uint64(maxBoundedAlloc+3*len(value)))
+	if err != nil {
+		t.Fatalf("Parse error = %v", err)
+	}
+	e, err := ds.FindElementByTag(privateBytesTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Value.GetValue().([]byte); !bytes.Equal(got, value) {
+		t.Errorf("OB value is %d bytes, want the %d written", len(got), len(value))
+	}
+	if _, err := ds.FindElementByTag(tag.PatientName); err != nil {
+		t.Errorf("element after the OB: %v", err)
+	}
+}
+
+func TestParse_NativeFramesTooSmallAreRefused(t *testing.T) {
+	const frames = 1 << 20
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "one-byte 8-bit frames",
+			data: explicitFile(nativeImage(1, 1, 8, 1, "1048576"), explicitElem(tag.PixelData, "OW", frames, make([]byte, frames))),
+		},
+		{
+			name: "one-byte 1-bit frames",
+			data: explicitFile(nativeImage(8, 1, 1, 1, "1048576"), explicitElem(tag.PixelData, "OW", frames, make([]byte, frames))),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseBounded(t, tc.data, maxBoundedAlloc)
+			if !errors.Is(err, ErrorNativeFramesTooSmall) {
+				t.Errorf("Parse error = %v, want %v", err, ErrorNativeFramesTooSmall)
+			}
+		})
+	}
+}
+
+// The allocation multiples nativeFrameOverhead documents, at the smallest
+// frames it accepts.
+func TestParse_NativeFramesAllocationMultiple(t *testing.T) {
+	cases := []struct {
+		name     string
+		image    []byte
+		vl       int
+		multiple int
+	}{
+		{name: "8-bit 16x10", image: nativeImage(16, 10, 8, 1, "4096"), vl: 160 * 4096, multiple: 2},
+		{name: "16-bit 8x10", image: nativeImage(8, 10, 16, 1, "4096"), vl: 160 * 4096, multiple: 2},
+		{name: "8-bit RGB 512x512", image: nativeImage(512, 512, 8, 3, "2 "), vl: 512 * 512 * 3 * 2, multiple: 2},
+		{name: "1-bit 40x32", image: nativeImage(40, 32, 1, 1, "1024"), vl: 160 * 1024, multiple: 65},
+		{name: "tiny frames within the allowance", image: nativeImage(1, 1, 8, 1, "400 "), vl: 400, multiple: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := explicitFile(tc.image, explicitElem(tag.PixelData, "OW", uint32(tc.vl), make([]byte, tc.vl)))
+			// 64 KiB covers the rest of the parse.
+			limit := uint64(tc.multiple*tc.vl + nativeOverheadAllowance + 64<<10)
+			if _, err := parseBounded(t, data, limit); err != nil {
+				t.Errorf("Parse error = %v", err)
+			}
+		})
+	}
+}
+
+func TestParse_TransferSyntaxesMissingFromTheUIDList(t *testing.T) {
+	for _, ts := range []string{
+		"1.2.840.10008.1.2.4.201", "1.2.840.10008.1.2.4.202", "1.2.840.10008.1.2.4.203", // HTJ2K
+		"1.2.840.10008.1.2.4.110", "1.2.840.10008.1.2.4.111", "1.2.840.10008.1.2.4.112", // JPEG XL
+	} {
+		t.Run(ts, func(t *testing.T) {
+			data := dicomFile(ts, cat(
+				explicitElem(tag.PatientName, "PN", 4, []byte("ABCD")),
+				explicitElem(tag.PixelData, "OB", tag.VLUndefinedLength, nil),
+				implicitElem(tag.Item, 0, nil),
+				implicitElem(tag.Item, 4, []byte{1, 2, 3, 4}),
+				seqDelimitation,
+			))
+			ds, err := parseBounded(t, data, maxBoundedAlloc)
+			if err != nil {
+				t.Fatalf("Parse error = %v", err)
+			}
+			e, err := ds.FindElementByTag(tag.PatientName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := MustGetStrings(e.Value); len(got) != 1 || got[0] != "ABCD" {
+				t.Errorf("PatientName = %v, want ABCD", got)
+			}
+			px, err := ds.FindElementByTag(tag.PixelData)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if frames := MustGetPixelDataInfo(px.Value).Frames; len(frames) != 1 {
+				t.Errorf("got %d frames, want 1", len(frames))
+			}
+		})
+	}
+}
+
+func TestParse_NonItemErrorOmitsTheValue(t *testing.T) {
+	value := make([]byte, 1<<20)
+	ob := explicitElem(privateBytesTag, "OB", uint32(len(value)), value)
+	cases := map[string][]byte{
+		"defined length":   explicitFile(explicitElem(tag.ContentSequence, "SQ", uint32(len(ob)), ob)),
+		"undefined length": explicitFile(explicitElem(tag.ContentSequence, "SQ", tag.VLUndefinedLength, nil), ob, seqDelimitation),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseBounded(t, data, uint64(maxBoundedAlloc+2*len(value)))
+			if err == nil {
+				t.Fatal("Parse returned no error")
+			}
+			if len(err.Error()) > 1024 {
+				t.Errorf("Parse error message is %d bytes, want at most 1024", len(err.Error()))
+			}
+		})
+	}
+}
+
+func TestReadBytes_OWIsLittleEndianWhateverTheByteOrder(t *testing.T) {
+	data := []byte{1, 2, 3, 4}
+	r := &reader{rawReader: dicomio.NewReader(bufio.NewReader(bytes.NewReader(data)), binary.BigEndian, int64(len(data)))}
+	v, err := r.readBytes(privateBytesTag, "OW", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := v.GetValue().([]byte), []byte{2, 1, 4, 3}; !bytes.Equal(got, want) {
+		t.Errorf("OW value = %v, want %v", got, want)
 	}
 }
