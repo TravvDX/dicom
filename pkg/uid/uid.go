@@ -3,7 +3,20 @@ package uid
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 )
+
+// standardTransferSyntaxRoot prefixes every transfer syntax the DICOM standard
+// defines, other than Implicit VR Little Endian itself.
+const standardTransferSyntaxRoot = "1.2.840.10008.1.2."
+
+// deflatedDatasetSyntaxes deflate the whole dataset after the file meta
+// group, as DeflatedExplicitVRLittleEndian does. Read as explicit VR little
+// endian, their compressed bytes would be parsed as elements.
+var deflatedDatasetSyntaxes = map[string]bool{
+	"1.2.840.10008.1.2.4.95":  true, // JPIP Referenced Deflate
+	"1.2.840.10008.1.2.4.205": true, // JPIP HTJ2K Referenced Deflate
+}
 
 // Standard list of transfer syntaxes.
 var StandardTransferSyntaxes = []string{
@@ -15,12 +28,11 @@ var StandardTransferSyntaxes = []string{
 
 // CanonicalTransferSyntaxUID return the canonical transfer syntax UID (e.g.,
 // dicomuid.ExplicitVRLittleEndian or dicomuid.ImplicitVRLittleEndian), given an
-// UID that represents any transfer syntax.  Returns an error if the uid is not
-// defined in DICOM standard, or if the uid does not represent a transfer
-// syntax.
-//
-// TODO(saito) Check the standard to see if we need to accept unknown UIDS as
-// explicit little endian.
+// UID that represents any transfer syntax. Syntaxes that deflate the dataset
+// return DeflatedExplicitVRLittleEndian. A uid under the standard's transfer
+// syntax root that is not in this package's list is taken to be explicit VR
+// little endian. Returns an error for any other uid not defined in DICOM
+// standard, or if the uid does not represent a transfer syntax.
 func CanonicalTransferSyntaxUID(uid string) (string, error) {
 	// defaults are explicit VR, little endian
 	switch uid {
@@ -30,8 +42,17 @@ func CanonicalTransferSyntaxUID(uid string) (string, error) {
 		DeflatedExplicitVRLittleEndian:
 		return uid, nil
 	default:
+		if deflatedDatasetSyntaxes[uid] {
+			return DeflatedExplicitVRLittleEndian, nil
+		}
 		e, err := Lookup(uid)
 		if err != nil {
+			// Standard transfer syntaxes added after this list (HTJ2K, JPEG
+			// XL, ...) are, like every listed one but the four above, explicit
+			// VR little endian.
+			if strings.HasPrefix(uid, standardTransferSyntaxRoot) {
+				return ExplicitVRLittleEndian, nil
+			}
 			return "", err
 		}
 		if e.Type != TypeTransferSyntax {

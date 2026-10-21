@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/suyashkumar/dicom/pkg/charset"
 	"github.com/suyashkumar/dicom/pkg/debug"
@@ -162,14 +163,21 @@ func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, 
 	ts, err := p.dataset.FindElementByTag(tag.TransferSyntaxUID)
 	if err == nil {
 		// If we found the transfer syntax, apply it.
-		tsStr := MustGetStrings(ts.Value)[0]
+		tsStrs, ok := ts.Value.GetValue().([]string)
+		if !ok || len(tsStrs) == 0 {
+			return nil, fmt.Errorf("TransferSyntaxUID has no string value: %w", ErrorElementNotFound)
+		}
+		tsStr := tsStrs[0]
 		bo, implicit, err = uid.ParseTransferSyntaxUID(tsStr)
+		if bo == nil {
+			return nil, fmt.Errorf("could not parse transfer syntax uid %q: %w", tsStr, err)
+		}
 		if err != nil {
 			// TODO(suyashkumar): should we attempt to parse with LittleEndian
 			// Implicit here?
 			debug.Log("WARN: could not parse transfer syntax uid in metadata")
 		}
-		if tsStr == uid.DeflatedExplicitVRLittleEndian {
+		if canonical, _ := uid.CanonicalTransferSyntaxUID(tsStr); canonical == uid.DeflatedExplicitVRLittleEndian {
 			p.reader.rawReader.SetDeflate()
 		}
 		p.SetTransferSyntax(bo, implicit)
@@ -250,16 +258,37 @@ func (p *Parser) Next() (*Element, error) {
 	// TODO: add dicom options to only keep track of certain tags
 
 	if elem.Tag == tag.SpecificCharacterSet {
-		encodingNames := MustGetStrings(elem.Value)
-		cs, err := charset.ParseSpecificCharacterSet(encodingNames)
-		if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
-			return nil, err
+		var cs charset.CodingSystem
+		switch v := elem.Value.GetValue().(type) {
+		case []string:
+			cs, err = charset.ParseSpecificCharacterSet(v)
+			if err != nil && !p.reader.opts.allowUnknownSpecificCharacterSet {
+				return nil, err
+			}
+		case []byte:
+			// Anonymizers write the value as UN or OB. Bytes that name no
+			// known character set take the default in every mode.
+			cs, _ = charset.ParseSpecificCharacterSet(characterSetNames(v))
 		}
 		p.reader.rawReader.SetCodingSystem(cs)
 	}
 
 	p.dataset.Elements = append(p.dataset.Elements, elem)
 	return elem, nil
+}
+
+// characterSetNames reads a SpecificCharacterSet value held as bytes as the
+// CS string it encodes.
+func characterSetNames(b []byte) []string {
+	s := strings.TrimRight(string(b), " \x00")
+	if s == "" {
+		return nil
+	}
+	names := strings.Split(s, "\\")
+	for i, n := range names {
+		names[i] = strings.TrimSpace(n)
+	}
+	return names
 }
 
 // GetMetadata returns just the set of metadata elements that have been parsed
@@ -284,10 +313,16 @@ type parseOptSet struct {
 	skipProcessingPixelDataValue       bool
 	allowMissingMetaElementGroupLength bool
 	allowUnknownSpecificCharacterSet   bool
+	maxSequenceDepth                   int
 }
 
+// DefaultMaxSequenceDepth is the sequence nesting depth allowed when the
+// MaxSequenceDepth option is not given. Structured report content trees, the
+// deepest found in practice, stay in the tens.
+const DefaultMaxSequenceDepth = 64
+
 func toParseOptSet(opts ...ParseOption) parseOptSet {
-	optSet := parseOptSet{}
+	optSet := parseOptSet{maxSequenceDepth: DefaultMaxSequenceDepth}
 	for _, opt := range opts {
 		opt(&optSet)
 	}
@@ -316,6 +351,16 @@ func AllowMissingMetaElementGroupLength() ParseOption {
 func AllowUnknownSpecificCharacterSet() ParseOption {
 	return func(set *parseOptSet) {
 		set.allowUnknownSpecificCharacterSet = true
+	}
+}
+
+// MaxSequenceDepth sets how deeply sequences may nest (a sequence inside an
+// item of another sequence is depth 2). Parsing a dataset nested deeper
+// returns ErrorSequenceTooDeep; n <= 0 refuses every sequence. The default is
+// DefaultMaxSequenceDepth.
+func MaxSequenceDepth(n int) ParseOption {
+	return func(set *parseOptSet) {
+		set.maxSequenceDepth = n
 	}
 }
 

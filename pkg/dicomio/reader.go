@@ -31,6 +31,9 @@ type Reader struct {
 	limit      int64
 	bytesRead  int64
 	limitStack []int64
+	// exactLimit is false when the limit is not a count of bytes the input
+	// holds: LimitReadUntilEOF, or a limit on deflated input.
+	exactLimit bool
 	// cs represents the CodingSystem to use when reading the string. If a
 	// particular encoding.Decoder within this CodingSystem is nil, assume
 	// UTF-8.
@@ -40,10 +43,11 @@ type Reader struct {
 // NewReader creates and returns a new *dicomio.Reader.
 func NewReader(in *bufio.Reader, bo binary.ByteOrder, limit int64) *Reader {
 	return &Reader{
-		in:        in,
-		bo:        bo,
-		limit:     limit,
-		bytesRead: 0,
+		in:         in,
+		bo:         bo,
+		limit:      limit,
+		bytesRead:  0,
+		exactLimit: limit != LimitReadUntilEOF,
 	}
 }
 
@@ -52,6 +56,68 @@ func (r *Reader) BytesLeftUntilLimit() int64 {
 		return math.MaxInt64
 	}
 	return r.limit - r.bytesRead
+}
+
+// Available returns ErrorInsufficientBytesLeft when n is more than the bytes
+// the Reader can still supply. With an exact limit that refuses a declared
+// length before anything is allocated; AppendBytes depends on it for that. The
+// limit is then the caller's size, so a caller passing a size larger than its
+// stream holds can be made to allocate up to that size.
+func (r *Reader) Available(n int64) error {
+	if n < 0 || n > r.BytesLeftUntilLimit() {
+		return ErrorInsufficientBytesLeft
+	}
+	return nil
+}
+
+// ExactLimit reports whether the limit counts bytes the input holds, so that
+// Available bounds what a read can return.
+func (r *Reader) ExactLimit() bool { return r.exactLimit }
+
+// growChunk is the most AppendBytes allocates for a value before its bytes
+// arrive when the limit is not exact.
+const growChunk = 64 << 10
+
+// ReadBytes reads exactly n bytes into a new slice, as AppendBytes does.
+func (r *Reader) ReadBytes(n int64) ([]byte, error) {
+	// Non-nil, so that an empty value stays empty rather than null.
+	return r.AppendBytes([]byte{}, n)
+}
+
+// AppendBytes reads exactly n bytes and appends them to dst. An n past the
+// limit is refused with an error wrapping ErrorInsufficientBytesLeft before
+// anything is read. When dst lacks room, an exact limit allocates once;
+// otherwise the buffer grows as bytes arrive: the buffer returned is at most
+// about twice the bytes read, and all the buffers grown on the way about
+// three times (four for a value cut short). Like io.ReadFull, it returns
+// io.EOF only if no bytes were read.
+func (r *Reader) AppendBytes(dst []byte, n int64) ([]byte, error) {
+	if err := r.Available(n); err != nil {
+		return nil, fmt.Errorf("%d bytes declared, %d left: %w", n, r.BytesLeftUntilLimit(), err)
+	}
+	start := int64(len(dst))
+	end := start + n
+	for int64(len(dst)) < end {
+		if len(dst) == cap(dst) {
+			want := end
+			if !r.exactLimit {
+				want = min(end, int64(len(dst))+max(int64(len(dst))-start, growChunk))
+			}
+			// Grown by hand: append's growth overshoots the target.
+			grown := make([]byte, len(dst), want)
+			copy(grown, dst)
+			dst = grown
+		}
+		got, err := io.ReadFull(r, dst[len(dst):min(int64(cap(dst)), end)])
+		dst = dst[:len(dst)+got]
+		if err != nil {
+			if err == io.EOF && int64(len(dst)) > start {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return dst, nil
 }
 
 func (r *Reader) Read(p []byte) (int, error) {
@@ -141,8 +207,7 @@ func internalReadString(data []byte, d *encoding.Decoder) (string, error) {
 
 // ReadString reads a string from the underlying *Reader.
 func (r *Reader) ReadString(n uint32) (string, error) {
-	data := make([]byte, n)
-	_, err := io.ReadFull(r, data)
+	data, err := r.ReadBytes(int64(n))
 	if err != nil {
 		return "", err
 	}
@@ -163,9 +228,14 @@ func (r *Reader) Skip(n int64) error {
 
 // PushLimit creates a limit n bytes from the current position.
 func (r *Reader) PushLimit(n int64) error {
+	// A negative n could land the limit on LimitReadUntilEOF, unlimiting
+	// a Reader whose limit is still taken as exact.
+	if n < 0 {
+		return fmt.Errorf("negative limit %d: %w", n, ErrorInsufficientBytesLeft)
+	}
 	newLimit := r.bytesRead + n
 	if newLimit > r.limit && r.limit != LimitReadUntilEOF {
-		return fmt.Errorf("new limit exceeds current limit of buffer, new limit: %d, limit: %d", newLimit, r.limit)
+		return fmt.Errorf("new limit exceeds current limit of buffer, new limit: %d, limit: %d: %w", newLimit, r.limit, ErrorInsufficientBytesLeft)
 	}
 
 	// Add current limit to the stack
@@ -202,13 +272,23 @@ func (r *Reader) SetTransferSyntax(bo binary.ByteOrder, implicit bool) {
 // transfer syntax. Right now this is expected to be called once when
 // parsing the top level dicom data, and there is no facility to swap
 // between deflate and non-deflate reading.
-// This also sets the current limit to LimitReadUntilEOF, since the original
-// limits (if any) will be based on uncompressed bytes.
+// The original limit counts compressed bytes, so it is replaced with the most
+// those bytes can inflate to, or LimitReadUntilEOF if there was no limit.
+// Either way the limit is no longer exact.
 func (r *Reader) SetDeflate() {
 	r.in = bufio.NewReader(flate.NewReader(r.in))
-	// TODO(https://github.com/suyashkumar/dicom/issues/320): consider always
-	// having the top level limit read until EOF.
-	r.limit = LimitReadUntilEOF // needed because original limits may not apply to the deflated *Reader
+	r.exactLimit = false
+	if r.limit == LimitReadUntilEOF {
+		return
+	}
+	// 1032:1 is deflate's maximum expansion ratio (zlib's technical details).
+	const maxDeflateRatio = 1032
+	left := r.limit - r.bytesRead
+	if left > (math.MaxInt64-r.bytesRead)/maxDeflateRatio {
+		r.limit = LimitReadUntilEOF
+		return
+	}
+	r.limit = r.bytesRead + left*maxDeflateRatio
 }
 
 // IsImplicit returns if the currently set transfer syntax on this *Reader is
